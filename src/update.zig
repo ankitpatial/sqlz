@@ -178,6 +178,175 @@ fn parseTagName(allocator: std.mem.Allocator, json: []const u8) ![]const u8 {
     return allocator.dupe(u8, value);
 }
 
+/// Main entrypoint for self-update. Checks for a newer release on GitHub,
+/// downloads the matching binary, and replaces the current executable.
+/// Returns the new version tag (caller-owned) on success.
+pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool) ![]const u8 {
+    // 1. Print "Checking for updates..."
+    if (use_color) try stderr.writeAll("\x1b[36m");
+    try stderr.writeAll("Checking for updates...\n");
+    if (use_color) try stderr.writeAll("\x1b[0m");
+    try stderr.flush();
+
+    // 2. Fetch the latest release tag from GitHub
+    const latest_tag = fetchLatestTag(allocator) catch |err| {
+        if (err == error.CurlFailed) {
+            if (use_color) try stderr.writeAll("\x1b[31m");
+            try stderr.writeAll("Failed to check for updates. Please ensure curl is installed and you have internet access.\n");
+            if (use_color) try stderr.writeAll("\x1b[0m");
+            try stderr.flush();
+        }
+        return err;
+    };
+    defer allocator.free(latest_tag);
+
+    // 3. Compare versions: strip leading "v" from latest tag
+    const latest_version = if (std.mem.startsWith(u8, latest_tag, "v")) latest_tag[1..] else latest_tag;
+
+    if (std.mem.eql(u8, latest_version, version)) {
+        // 4. Already up to date
+        if (use_color) try stderr.writeAll("\x1b[32m");
+        try stderr.print("Already up to date (v{s}).\n", .{version});
+        if (use_color) try stderr.writeAll("\x1b[0m");
+        try stderr.flush();
+        return error.AlreadyUpToDate;
+    }
+
+    // 5. Print version transition
+    try stderr.print("New version available: v{s} -> {s}\n", .{ version, latest_tag });
+    try stderr.flush();
+
+    // 6. Build the download URL and perform the update
+    const download_url = try buildDownloadUrl(allocator, latest_tag);
+    defer allocator.free(download_url);
+
+    try downloadAndReplace(allocator, download_url, stderr, use_color);
+
+    // 7. Print success
+    if (use_color) try stderr.writeAll("\x1b[32m");
+    try stderr.print("Updated zqlc v{s} -> {s}\n", .{ version, latest_tag });
+    if (use_color) try stderr.writeAll("\x1b[0m");
+    try stderr.flush();
+
+    // 8. Return the latest tag (caller-owned)
+    return allocator.dupe(u8, latest_tag);
+}
+
+/// Downloads the release archive from `url`, extracts the binary, and replaces
+/// the current executable in-place.
+fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *std.Io.Writer, use_color: bool) !void {
+    const is_windows = builtin.os.tag == .windows;
+    const archive_path = if (is_windows) "C:\\Temp\\zqlc-update.zip" else "/tmp/zqlc-update.tar.gz";
+    const extracted_binary = if (is_windows) "C:\\Temp\\zqlc.exe" else "/tmp/zqlc";
+
+    // 1. Download the archive
+    if (use_color) try stderr.writeAll("\x1b[36m");
+    try stderr.writeAll("Downloading...\n");
+    if (use_color) try stderr.writeAll("\x1b[0m");
+    try stderr.flush();
+
+    const dl_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "curl", "-sfL", "-o", archive_path, url },
+    }) catch {
+        return error.DownloadFailed;
+    };
+    defer allocator.free(dl_result.stderr);
+    defer allocator.free(dl_result.stdout);
+
+    switch (dl_result.term) {
+        .Exited => |code| {
+            if (code != 0) return error.DownloadFailed;
+        },
+        else => return error.DownloadFailed,
+    }
+
+    // 2. Extract the binary from the archive
+    if (use_color) try stderr.writeAll("\x1b[36m");
+    try stderr.writeAll("Extracting...\n");
+    if (use_color) try stderr.writeAll("\x1b[0m");
+    try stderr.flush();
+
+    if (is_windows) {
+        // Windows: use PowerShell to extract
+        const ps_cmd = "Expand-Archive -Force -Path 'C:\\Temp\\zqlc-update.zip' -DestinationPath 'C:\\Temp'";
+        const ext_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "powershell", "-NoProfile", "-Command", ps_cmd },
+        }) catch {
+            return error.ExtractionFailed;
+        };
+        defer allocator.free(ext_result.stderr);
+        defer allocator.free(ext_result.stdout);
+
+        switch (ext_result.term) {
+            .Exited => |code| {
+                if (code != 0) return error.ExtractionFailed;
+            },
+            else => return error.ExtractionFailed,
+        }
+    } else {
+        // Unix: use tar to extract
+        const ext_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "tar", "-xzf", archive_path, "-C", "/tmp", "zqlc" },
+        }) catch {
+            return error.ExtractionFailed;
+        };
+        defer allocator.free(ext_result.stderr);
+        defer allocator.free(ext_result.stdout);
+
+        switch (ext_result.term) {
+            .Exited => |code| {
+                if (code != 0) return error.ExtractionFailed;
+            },
+            else => return error.ExtractionFailed,
+        }
+    }
+
+    // 3. Get current executable path
+    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+        return error.ReplaceFailed;
+    };
+
+    // 4. Read the new binary and write it over the current executable
+    const new_binary = blk: {
+        const file = std.fs.openFileAbsolute(extracted_binary, .{}) catch {
+            return error.ReplaceFailed;
+        };
+        defer file.close();
+        break :blk file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch {
+            return error.ReplaceFailed;
+        };
+    };
+    defer allocator.free(new_binary);
+
+    // Write over the current executable
+    const exe_file = std.fs.openFileAbsolute(exe_path, .{ .mode = .write_only }) catch {
+        return error.ReplaceFailed;
+    };
+    defer exe_file.close();
+    exe_file.writeAll(new_binary) catch {
+        return error.ReplaceFailed;
+    };
+
+    // 5. Set executable permissions on Unix
+    if (!is_windows) {
+        const posix_file = std.fs.openFileAbsolute(exe_path, .{ .mode = .read_only }) catch {
+            return error.ReplaceFailed;
+        };
+        defer posix_file.close();
+        posix_file.chmod(0o755) catch {
+            return error.ReplaceFailed;
+        };
+    }
+
+    // 6. Clean up temp files
+    std.fs.deleteFileAbsolute(archive_path) catch {};
+    std.fs.deleteFileAbsolute(extracted_binary) catch {};
+}
+
 test "parseTagName extracts tag from normal JSON" {
     const allocator = std.testing.allocator;
     const json =
