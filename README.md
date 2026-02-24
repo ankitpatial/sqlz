@@ -12,9 +12,21 @@ Reads `.sql` files, introspects a live PostgreSQL database, and generates Zig st
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/ankitpatial/zqlc/main/install.sh | sh
+```
+
+To update to the latest version:
+
+```sh
+zqlc update
+```
+
+### Build from source
+
+```sh
 git clone https://github.com/ankitpatial/zqlc.git
 cd zqlc
-zig build -Doptimize=.ReleaseSafe
+zig build -Doptimize=ReleaseSafe
 # copy zig-out/bin/zqlc somewhere on your PATH
 ```
 
@@ -77,6 +89,7 @@ zqlc <command> --src <dir> --dest <dir>
 |------------|----------------------------------------------|
 | `generate` | Generate Zig code from SQL files             |
 | `check`    | Check if generated files are up to date      |
+| `update`   | Update zqlc to the latest version            |
 
 ### Options
 
