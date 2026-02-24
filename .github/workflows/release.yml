@@ -53,7 +53,7 @@ jobs:
 
           for triple in "${targets[@]}"; do
             echo "==> Building for $triple"
-            zig build -Dtarget="$triple" -Doptimize=.ReleaseSafe
+            zig build -Dtarget="$triple" -Doptimize=ReleaseSafe
 
             case "$triple" in
               *-windows)
