@@ -42,12 +42,9 @@ pub fn describeQueries(
     allocator: std.mem.Allocator,
     conn: *connection.Connection,
     untyped: []const query_mod.UntypedQuery,
+    type_cache: *types.TypeCache,
+    null_cache: *types.NullabilityCache,
 ) !std.ArrayList(TypedQuery) {
-    var type_cache = types.TypeCache.init(allocator);
-    defer type_cache.deinit();
-    var null_cache = types.NullabilityCache.init(allocator);
-    defer null_cache.deinit();
-
     var result: std.ArrayList(TypedQuery) = .empty;
     errdefer {
         for (result.items) |*tq| tq.deinit(allocator);
@@ -55,7 +52,7 @@ pub fn describeQueries(
     }
 
     for (untyped) |uq| {
-        const typed = try describeOne(allocator, conn, &type_cache, &null_cache, uq);
+        const typed = try describeOne(allocator, conn, type_cache, null_cache, uq);
         try result.append(allocator, typed);
     }
 
@@ -88,6 +85,22 @@ fn quoteAliasHints(allocator: std.mem.Allocator, sql: []const u8) ![]const u8 {
                     }
                     break;
                 }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip block comments
+        if (c == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            try result.appendSlice(allocator, "/*");
+            i += 2;
+            while (i + 1 < sql.len) {
+                if (sql[i] == '*' and sql[i + 1] == '/') {
+                    try result.appendSlice(allocator, "*/");
+                    i += 2;
+                    break;
+                }
+                try result.append(allocator, sql[i]);
                 i += 1;
             }
             continue;
@@ -462,6 +475,7 @@ fn tryInsertColumns(sql: []const u8, names: [][]const u8) bool {
     var col_count: usize = 0;
     while (pos < sql.len and col_count < 64) {
         pos = skipWhitespace(sql, pos);
+        if (pos >= sql.len) return false;
         if (sql[pos] == ')') {
             pos += 1;
             break;
@@ -489,6 +503,7 @@ fn tryInsertColumns(sql: []const u8, names: [][]const u8) bool {
     var param_idx: usize = 0;
     while (pos < sql.len and param_idx < col_count) {
         pos = skipWhitespace(sql, pos);
+        if (pos >= sql.len) break;
         if (sql[pos] == ')') break;
         if (sql[pos] == ',') {
             pos += 1;

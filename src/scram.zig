@@ -124,10 +124,11 @@ pub fn verifyServerFinal(state: *const ScramState, server_final: []const u8) !vo
     var expected_sig: [32]u8 = undefined;
     HmacSha256.create(&expected_sig, state.auth_message, &server_key);
 
-    var expected_b64: [44]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&expected_b64, &expected_sig);
+    // Decode received signature and compare in constant time
+    var received_sig: [32]u8 = undefined;
+    std.base64.standard.Decoder.decode(&received_sig, sig_b64) catch return error.ServerSignatureMismatch;
 
-    if (!std.mem.eql(u8, sig_b64, &expected_b64)) {
+    if (!std.crypto.timing_safe.eql([32]u8, received_sig, expected_sig)) {
         return error.ServerSignatureMismatch;
     }
 }

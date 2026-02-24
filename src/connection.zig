@@ -7,7 +7,8 @@ pub const Connection = struct {
     stream: std.net.Stream,
     recv_buf: [16384]u8 = undefined,
     recv_len: usize = 0,
-    send_buf: [16384]u8 = undefined,
+    recv_start: usize = 0,
+    send_buf: std.ArrayList(u8) = .empty,
 
     /// Connect to a PostgreSQL server, authenticate, and wait for ReadyForQuery.
     pub fn connect(
@@ -27,10 +28,11 @@ pub const Connection = struct {
             .allocator = allocator,
             .stream = stream,
         };
+        errdefer self.send_buf.deinit(allocator);
 
         // Send StartupMessage
-        const n = try protocol.encodeStartup(&self.send_buf, user, database);
-        try stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeStartup(allocator, &self.send_buf, user, database);
+        try stream.writeAll(self.send_buf.items);
 
         // Read messages until ReadyForQuery
         while (true) {
@@ -38,7 +40,7 @@ pub const Connection = struct {
             switch (msg) {
                 .auth_ok => {},
                 .auth_cleartext, .auth_md5, .auth_sasl => {
-                    try auth.authenticate(allocator, stream, msg, user, password);
+                    try auth.authenticate(allocator, &self, msg, user, password);
                 },
                 .parameter_status => {},
                 .backend_key_data => {},
@@ -52,43 +54,46 @@ pub const Connection = struct {
 
     /// Send a Parse message.
     pub fn sendParse(self: *Connection, stmt_name: []const u8, sql: []const u8) !void {
-        const n = try protocol.encodeParse(&self.send_buf, stmt_name, sql);
-        try self.stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeParse(self.allocator, &self.send_buf, stmt_name, sql);
+        try self.stream.writeAll(self.send_buf.items);
     }
 
     /// Send a Describe message for a statement.
     pub fn sendDescribeStatement(self: *Connection, stmt_name: []const u8) !void {
-        const n = try protocol.encodeDescribe(&self.send_buf, 'S', stmt_name);
-        try self.stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeDescribe(self.allocator, &self.send_buf, 'S', stmt_name);
+        try self.stream.writeAll(self.send_buf.items);
     }
 
     /// Send a Sync message.
     pub fn sendSync(self: *Connection) !void {
-        const n = try protocol.encodeSync(&self.send_buf);
-        try self.stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeSync(self.allocator, &self.send_buf);
+        try self.stream.writeAll(self.send_buf.items);
     }
 
     /// Send a simple Query message.
     pub fn sendQuery(self: *Connection, sql: []const u8) !void {
-        const n = try protocol.encodeQuery(&self.send_buf, sql);
-        try self.stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeQuery(self.allocator, &self.send_buf, sql);
+        try self.stream.writeAll(self.send_buf.items);
     }
 
     /// Send a Close statement message.
     pub fn sendCloseStatement(self: *Connection, stmt_name: []const u8) !void {
-        const n = try protocol.encodeClose(&self.send_buf, 'S', stmt_name);
-        try self.stream.writeAll(self.send_buf[0..n]);
+        try protocol.encodeClose(self.allocator, &self.send_buf, 'S', stmt_name);
+        try self.stream.writeAll(self.send_buf.items);
     }
 
     /// Receive the next backend message.
     pub fn recvMsg(self: *Connection) !protocol.BackendMsg {
         while (true) {
-            if (self.recv_len >= 5) {
+            const available = self.recv_len - self.recv_start;
+            if (available >= 5) {
                 const result = protocol.readBackendMsg(
-                    self.recv_buf[0..self.recv_len],
+                    self.recv_buf[self.recv_start..self.recv_len],
                     self.allocator,
                 ) catch |err| switch (err) {
                     error.NeedMoreData => {
+                        // Compact before reading if no room at end
+                        self.compactRecvBuf();
                         const bytes_read = try self.stream.read(self.recv_buf[self.recv_len..]);
                         if (bytes_read == 0) return error.ConnectionClosed;
                         self.recv_len += bytes_read;
@@ -97,19 +102,32 @@ pub const Connection = struct {
                     else => return err,
                 };
 
-                const remaining = self.recv_len - result.consumed;
-                if (remaining > 0) {
-                    std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[result.consumed..self.recv_len]);
+                self.recv_start += result.consumed;
+
+                // Compact when cursor is past halfway
+                if (self.recv_start > self.recv_buf.len / 2) {
+                    self.compactRecvBuf();
                 }
-                self.recv_len = remaining;
 
                 return result.msg;
             }
 
+            // Compact before reading if no room at end
+            self.compactRecvBuf();
             const bytes_read = try self.stream.read(self.recv_buf[self.recv_len..]);
             if (bytes_read == 0) return error.ConnectionClosed;
             self.recv_len += bytes_read;
         }
+    }
+
+    fn compactRecvBuf(self: *Connection) void {
+        if (self.recv_start == 0) return;
+        const remaining = self.recv_len - self.recv_start;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[self.recv_start..self.recv_len]);
+        }
+        self.recv_len = remaining;
+        self.recv_start = 0;
     }
 
     /// Receive messages until ReadyForQuery.
@@ -129,8 +147,9 @@ pub const Connection = struct {
 
     /// Send a Terminate message and close the connection.
     pub fn close(self: *Connection) void {
-        const n = protocol.encodeTerminate(&self.send_buf) catch return;
-        self.stream.writeAll(self.send_buf[0..n]) catch {};
+        protocol.encodeTerminate(self.allocator, &self.send_buf) catch {};
+        self.stream.writeAll(self.send_buf.items) catch {};
+        self.send_buf.deinit(self.allocator);
         self.stream.close();
     }
 };

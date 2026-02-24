@@ -227,6 +227,12 @@ pub fn main() !void {
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
+    // Create caches shared across all groups
+    var type_cache = lib.types.TypeCache.init(allocator);
+    defer type_cache.deinit();
+    var null_cache = lib.types.NullabilityCache.init(allocator);
+    defer null_cache.deinit();
+
     var error_count: usize = 0;
     const output_base = dest_dir;
 
@@ -273,6 +279,8 @@ pub fn main() !void {
             allocator,
             &conn,
             untyped_queries.items,
+            &type_cache,
+            &null_cache,
         ) catch |err| {
             const e = lib.errors.Error{ .query_error = .{
                 .file_path = group.parent_dir,

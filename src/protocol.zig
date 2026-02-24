@@ -20,11 +20,11 @@ pub const ErrorField = struct {
 // ─── Frontend Messages ──────────────────────────────────────────────────────
 
 /// Encode a StartupMessage (no message type byte).
-pub fn encodeStartup(buf: []u8, user: []const u8, database: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeStartup(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), user: []const u8, database: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
-    try w.writeInt(i32, 0, .big);
+    try w.writeInt(i32, 0, .big); // placeholder for length
     try w.writeInt(i32, 196608, .big); // Protocol version 3.0
     try w.writeAll("user\x00");
     try w.writeAll(user);
@@ -34,28 +34,25 @@ pub fn encodeStartup(buf: []u8, user: []const u8, database: []const u8) !usize {
     try w.writeByte(0);
     try w.writeByte(0); // terminator
 
-    const pos = fbs.pos;
-    std.mem.writeInt(i32, buf[0..4], @intCast(pos), .big);
-    return pos;
+    std.mem.writeInt(i32, buf.items[0..4], @intCast(buf.items.len), .big);
 }
 
 /// Encode a PasswordMessage ('p').
-pub fn encodePassword(buf: []u8, password: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodePassword(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), password: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('p');
     const len: i32 = @intCast(4 + password.len + 1);
     try w.writeInt(i32, len, .big);
     try w.writeAll(password);
     try w.writeByte(0);
-    return fbs.pos;
 }
 
 /// Encode a SASLInitialResponse message ('p').
-pub fn encodeSaslInitial(buf: []u8, mechanism: []const u8, client_first: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeSaslInitial(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), mechanism: []const u8, client_first: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('p');
     const len: i32 = @intCast(4 + mechanism.len + 1 + 4 + client_first.len);
@@ -64,25 +61,23 @@ pub fn encodeSaslInitial(buf: []u8, mechanism: []const u8, client_first: []const
     try w.writeByte(0);
     try w.writeInt(i32, @intCast(client_first.len), .big);
     try w.writeAll(client_first);
-    return fbs.pos;
 }
 
 /// Encode a SASLResponse message ('p').
-pub fn encodeSaslResponse(buf: []u8, data: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeSaslResponse(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('p');
     const len: i32 = @intCast(4 + data.len);
     try w.writeInt(i32, len, .big);
     try w.writeAll(data);
-    return fbs.pos;
 }
 
 /// Encode a Parse message.
-pub fn encodeParse(buf: []u8, stmt_name: []const u8, query_sql: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeParse(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), stmt_name: []const u8, query_sql: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('P');
     const len: i32 = @intCast(4 + stmt_name.len + 1 + query_sql.len + 1 + 2);
@@ -92,13 +87,12 @@ pub fn encodeParse(buf: []u8, stmt_name: []const u8, query_sql: []const u8) !usi
     try w.writeAll(query_sql);
     try w.writeByte(0);
     try w.writeInt(i16, 0, .big); // let server decide param types
-    return fbs.pos;
 }
 
 /// Encode a Describe message ('D').
-pub fn encodeDescribe(buf: []u8, target: u8, name: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeDescribe(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), target: u8, name: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('D');
     const len: i32 = @intCast(4 + 1 + name.len + 1);
@@ -106,46 +100,42 @@ pub fn encodeDescribe(buf: []u8, target: u8, name: []const u8) !usize {
     try w.writeByte(target); // 'S' for statement, 'P' for portal
     try w.writeAll(name);
     try w.writeByte(0);
-    return fbs.pos;
 }
 
 /// Encode a Sync message ('S').
-pub fn encodeSync(buf: []u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeSync(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('S');
     try w.writeInt(i32, 4, .big);
-    return fbs.pos;
 }
 
 /// Encode a Terminate message ('X').
-pub fn encodeTerminate(buf: []u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeTerminate(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('X');
     try w.writeInt(i32, 4, .big);
-    return fbs.pos;
 }
 
 /// Encode a simple Query message ('Q').
-pub fn encodeQuery(buf: []u8, sql: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeQuery(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('Q');
     const len: i32 = @intCast(4 + sql.len + 1);
     try w.writeInt(i32, len, .big);
     try w.writeAll(sql);
     try w.writeByte(0);
-    return fbs.pos;
 }
 
 /// Encode a Close statement message ('C').
-pub fn encodeClose(buf: []u8, target: u8, name: []const u8) !usize {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+pub fn encodeClose(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), target: u8, name: []const u8) !void {
+    buf.clearRetainingCapacity();
+    const w = buf.writer(allocator);
 
     try w.writeByte('C');
     const len: i32 = @intCast(4 + 1 + name.len + 1);
@@ -153,7 +143,6 @@ pub fn encodeClose(buf: []u8, target: u8, name: []const u8) !usize {
     try w.writeByte(target);
     try w.writeAll(name);
     try w.writeByte(0);
-    return fbs.pos;
 }
 
 // ─── Backend Messages ───────────────────────────────────────────────────────
@@ -198,7 +187,7 @@ pub fn readBackendMsg(data: []const u8, allocator: std.mem.Allocator) !struct { 
     const msg: BackendMsg = switch (msg_type) {
         'R' => try parseAuth(payload),
         'S' => try parseParameterStatus(payload, allocator),
-        'K' => parseBackendKeyData(payload),
+        'K' => try parseBackendKeyData(payload),
         'Z' => .{ .ready_for_query = if (payload.len > 0) payload[0] else 'I' },
         '1' => .parse_complete,
         '2' => .bind_complete,
@@ -241,7 +230,8 @@ fn parseParameterStatus(payload: []const u8, allocator: std.mem.Allocator) !Back
     return .{ .parameter_status = .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, value) } };
 }
 
-fn parseBackendKeyData(payload: []const u8) BackendMsg {
+fn parseBackendKeyData(payload: []const u8) !BackendMsg {
+    if (payload.len < 8) return error.ProtocolError;
     return .{ .backend_key_data = .{
         .pid = std.mem.readInt(u32, payload[0..4], .big),
         .secret = std.mem.readInt(u32, payload[4..8], .big),
@@ -341,24 +331,30 @@ fn cstring(data: []const u8) []const u8 {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "encode startup message" {
-    var buf: [256]u8 = undefined;
-    const n = try encodeStartup(&buf, "testuser", "testdb");
-    const proto = std.mem.readInt(i32, buf[4..8], .big);
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeStartup(allocator, &buf, "testuser", "testdb");
+    const proto = std.mem.readInt(i32, buf.items[4..8], .big);
     try std.testing.expectEqual(@as(i32, 196608), proto);
-    const len = std.mem.readInt(i32, buf[0..4], .big);
-    try std.testing.expectEqual(@as(i32, @intCast(n)), len);
+    const len = std.mem.readInt(i32, buf.items[0..4], .big);
+    try std.testing.expectEqual(@as(i32, @intCast(buf.items.len)), len);
 }
 
 test "encode sync message" {
-    var buf: [8]u8 = undefined;
-    const n = try encodeSync(&buf);
-    try std.testing.expectEqual(@as(usize, 5), n);
-    try std.testing.expectEqual(@as(u8, 'S'), buf[0]);
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeSync(allocator, &buf);
+    try std.testing.expectEqual(@as(usize, 5), buf.items.len);
+    try std.testing.expectEqual(@as(u8, 'S'), buf.items[0]);
 }
 
 test "encode parse message" {
-    var buf: [256]u8 = undefined;
-    const n = try encodeParse(&buf, "", "SELECT 1");
-    try std.testing.expectEqual(@as(u8, 'P'), buf[0]);
-    try std.testing.expect(n > 5);
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeParse(allocator, &buf, "", "SELECT 1");
+    try std.testing.expectEqual(@as(u8, 'P'), buf.items[0]);
+    try std.testing.expect(buf.items.len > 5);
 }

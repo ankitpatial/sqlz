@@ -1,31 +1,31 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const scram = @import("scram.zig");
+const Connection = @import("connection.zig").Connection;
 
 /// Perform authentication handshake after receiving the initial auth request.
 pub fn authenticate(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: *Connection,
     msg: protocol.BackendMsg,
     user: []const u8,
     password: []const u8,
 ) !void {
     switch (msg) {
         .auth_ok => return,
-        .auth_cleartext => try handleCleartext(stream, password),
-        .auth_md5 => |salt| try handleMd5(stream, user, password, salt),
-        .auth_sasl => try handleScram(allocator, stream, user, password),
+        .auth_cleartext => try handleCleartext(allocator, conn, password),
+        .auth_md5 => |salt| try handleMd5(allocator, conn, user, password, salt),
+        .auth_sasl => try handleScram(allocator, conn, user, password),
         else => return error.UnsupportedAuthMethod,
     }
 }
 
-fn handleCleartext(stream: std.net.Stream, password: []const u8) !void {
-    var buf: [1024]u8 = undefined;
-    const n = try protocol.encodePassword(&buf, password);
-    try stream.writeAll(buf[0..n]);
+fn handleCleartext(allocator: std.mem.Allocator, conn: *Connection, password: []const u8) !void {
+    try protocol.encodePassword(allocator, &conn.send_buf, password);
+    try conn.stream.writeAll(conn.send_buf.items);
 }
 
-fn handleMd5(stream: std.net.Stream, user: []const u8, password: []const u8, salt: [4]u8) !void {
+fn handleMd5(allocator: std.mem.Allocator, conn: *Connection, user: []const u8, password: []const u8, salt: [4]u8) !void {
     const Md5 = std.crypto.hash.Md5;
     const hex_chars = "0123456789abcdef";
 
@@ -59,26 +59,22 @@ fn handleMd5(stream: std.net.Stream, user: []const u8, password: []const u8, sal
     @memcpy(pw_buf[0..3], "md5");
     @memcpy(pw_buf[3..35], &outer_hex);
 
-    var buf: [1024]u8 = undefined;
-    const n = try protocol.encodePassword(&buf, &pw_buf);
-    try stream.writeAll(buf[0..n]);
+    try protocol.encodePassword(allocator, &conn.send_buf, &pw_buf);
+    try conn.stream.writeAll(conn.send_buf.items);
 }
 
-fn handleScram(allocator: std.mem.Allocator, stream: std.net.Stream, user: []const u8, password: []const u8) !void {
-    var buf: [4096]u8 = undefined;
-
+fn handleScram(allocator: std.mem.Allocator, conn: *Connection, user: []const u8, password: []const u8) !void {
     // Step 1: Send SASLInitialResponse with client-first-message
     const first = try scram.clientFirst(allocator, user);
     var state = first.state;
     defer state.deinit();
     defer allocator.free(first.message);
 
-    const n1 = try protocol.encodeSaslInitial(&buf, "SCRAM-SHA-256", first.message);
-    try stream.writeAll(buf[0..n1]);
+    try protocol.encodeSaslInitial(allocator, &conn.send_buf, "SCRAM-SHA-256", first.message);
+    try conn.stream.writeAll(conn.send_buf.items);
 
     // Step 2: Receive server-first-message
-    var recv_buf: [4096]u8 = undefined;
-    const server_first_data = try recvAuthMsg(stream, &recv_buf);
+    const server_first_data = try conn.recvMsg();
 
     switch (server_first_data) {
         .auth_sasl_continue => |data| {
@@ -86,11 +82,11 @@ fn handleScram(allocator: std.mem.Allocator, stream: std.net.Stream, user: []con
             const client_final = try scram.clientFinal(allocator, &state, password, data);
             defer allocator.free(client_final);
 
-            const n2 = try protocol.encodeSaslResponse(&buf, client_final);
-            try stream.writeAll(buf[0..n2]);
+            try protocol.encodeSaslResponse(allocator, &conn.send_buf, client_final);
+            try conn.stream.writeAll(conn.send_buf.items);
 
             // Step 4: Receive server-final-message
-            const server_final_data = try recvAuthMsg(stream, &recv_buf);
+            const server_final_data = try conn.recvMsg();
             switch (server_final_data) {
                 .auth_sasl_final => |fdata| {
                     try scram.verifyServerFinal(&state, fdata);
@@ -100,7 +96,7 @@ fn handleScram(allocator: std.mem.Allocator, stream: std.net.Stream, user: []con
             }
 
             // Step 5: Receive AuthenticationOk
-            const ok_msg = try recvAuthMsg(stream, &recv_buf);
+            const ok_msg = try conn.recvMsg();
             switch (ok_msg) {
                 .auth_ok => return,
                 .error_response => return error.AuthenticationFailed,
@@ -110,15 +106,6 @@ fn handleScram(allocator: std.mem.Allocator, stream: std.net.Stream, user: []con
         .error_response => return error.AuthenticationFailed,
         else => return error.UnexpectedMessage,
     }
-}
-
-fn recvAuthMsg(stream: std.net.Stream, buf: []u8) !protocol.BackendMsg {
-    const n = try stream.read(buf);
-    if (n == 0) return error.ConnectionClosed;
-
-    var fba = std.heap.FixedBufferAllocator.init(buf[n..]);
-    const result = try protocol.readBackendMsg(buf[0..n], fba.allocator());
-    return result.msg;
 }
 
 test "md5 auth hash computation" {
