@@ -224,7 +224,7 @@ fn emitOneFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q: int
     try emitSqlLiteral(allocator, buf, q.sql, 8);
     try buf.appendSlice(allocator, "    , ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
-    try buf.appendSlice(allocator, ")) |row| {\n");
+    try buf.appendSlice(allocator, ")) |*row| {\n");
     try buf.appendSlice(allocator, "        defer row.deinit();\n");
 
     // return .{ .field = row.get(...), ... };
@@ -784,6 +784,7 @@ test "generate one query" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "pub fn getEmail(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "pool.row(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "|*row|") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "defer row.deinit()") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "return null") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "allocator.dupe(u8,") != null);

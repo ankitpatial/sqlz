@@ -20,7 +20,7 @@ pub fn findUserById(pool: *pg.Pool, allocator: std.mem.Allocator, id: i32) !?Fin
         \\ SELECT id, name, email, bio, is_active, created_at
         \\ FROM users
         \\ WHERE id = $1
-    , .{id})) |row| {
+    , .{id})) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -85,7 +85,7 @@ pub fn getPostWithAuthor(pool: *pg.Pool, allocator: std.mem.Allocator, id: i32) 
         \\ FROM posts p
         \\ JOIN users u ON u.id = p.user_id
         \\ WHERE p.id = $1
-    , .{id})) |row| {
+    , .{id})) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -213,7 +213,7 @@ pub fn createUser(pool: *pg.Pool, allocator: std.mem.Allocator, name: []const u8
         \\ INSERT INTO users (name, email, bio)
         \\ VALUES ($1, $2, $3)
         \\ RETURNING id, name, email, bio, is_active, created_at
-    , .{ name, email, bio })) |row| {
+    , .{ name, email, bio })) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -242,7 +242,7 @@ pub fn createPost(pool: *pg.Pool, allocator: std.mem.Allocator, user_id: i32, ti
         \\ INSERT INTO posts (user_id, title, body)
         \\ VALUES ($1, $2, $3)
         \\ RETURNING id, user_id, title, body, published, created_at
-    , .{ user_id, title, body })) |row| {
+    , .{ user_id, title, body })) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -270,7 +270,7 @@ pub fn addComment(pool: *pg.Pool, allocator: std.mem.Allocator, post_id: i32, us
         \\ INSERT INTO comments (post_id, user_id, body)
         \\ VALUES ($1, $2, $3)
         \\ RETURNING id, post_id, user_id, body, created_at
-    , .{ post_id, user_id, body })) |row| {
+    , .{ post_id, user_id, body })) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -305,7 +305,7 @@ pub fn updateUserEmail(pool: *pg.Pool, allocator: std.mem.Allocator, id: i32, em
         \\ SET email = $2
         \\ WHERE id = $1
         \\ RETURNING id, name, email
-    , .{ id, email })) |row| {
+    , .{ id, email })) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
@@ -340,7 +340,7 @@ pub fn updateUser(pool: *pg.Pool, allocator: std.mem.Allocator, params: UpdateUs
         \\ SET name = $2, email = $3, bio = $4, is_active = $5
         \\ WHERE id = $1
         \\ RETURNING id, name, email, bio, is_active, created_at
-    , .{ params.id, params.name, params.email, params.bio, params.is_active })) |row| {
+    , .{ params.id, params.name, params.email, params.bio, params.is_active })) |*row| {
         defer row.deinit();
         return .{
             .id = row.get(i32, 0),
