@@ -224,8 +224,9 @@ fn emitOneFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q: int
     try emitSqlLiteral(allocator, buf, q.sql, 8);
     try buf.appendSlice(allocator, "    , ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
-    try buf.appendSlice(allocator, ")) |*row| {\n");
-    try buf.appendSlice(allocator, "        defer row.deinit();\n");
+    try buf.appendSlice(allocator, ")) |r| {\n");
+    try buf.appendSlice(allocator, "        var row = r;\n");
+    try buf.appendSlice(allocator, "        defer row.deinit() catch {};\n");
 
     // return .{ .field = row.get(...), ... };
     try buf.appendSlice(allocator, "        return .{\n");
@@ -409,19 +410,19 @@ fn emitRowFieldAssignment(allocator: std.mem.Allocator, buf: *std.ArrayList(u8),
     if (col.nullable and is_enum) {
         const pascal = try snakeToPascal(allocator, col.zig_type.pg_enum.name);
         defer allocator.free(pascal);
-        try appendFmt(allocator, buf, "if (row.get(?[]u8, {d})) |v| (std.meta.stringToEnum({s}{s}, v) orelse return error.InvalidEnumValue) else null", .{ index, prefix, pascal });
+        try appendFmt(allocator, buf, "if (try row.get(?[]u8, {d})) |v| (std.meta.stringToEnum({s}{s}, v) orelse return error.InvalidEnumValue) else null", .{ index, prefix, pascal });
     } else if (col.nullable and needs_dupe) {
-        try appendFmt(allocator, buf, "if (row.get(?{s}, {d})) |v| try allocator.dupe(u8, v) else null", .{ pg_type, index });
+        try appendFmt(allocator, buf, "if (try row.get(?{s}, {d})) |v| try allocator.dupe(u8, v) else null", .{ pg_type, index });
     } else if (col.nullable) {
-        try appendFmt(allocator, buf, "row.get(?{s}, {d})", .{ pg_type, index });
+        try appendFmt(allocator, buf, "try row.get(?{s}, {d})", .{ pg_type, index });
     } else if (is_enum) {
         const pascal = try snakeToPascal(allocator, col.zig_type.pg_enum.name);
         defer allocator.free(pascal);
-        try appendFmt(allocator, buf, "std.meta.stringToEnum({s}{s}, row.get([]u8, {d})) orelse return error.InvalidEnumValue", .{ prefix, pascal, index });
+        try appendFmt(allocator, buf, "std.meta.stringToEnum({s}{s}, try row.get([]u8, {d})) orelse return error.InvalidEnumValue", .{ prefix, pascal, index });
     } else if (needs_dupe) {
-        try appendFmt(allocator, buf, "try allocator.dupe(u8, row.get({s}, {d}))", .{ pg_type, index });
+        try appendFmt(allocator, buf, "try allocator.dupe(u8, try row.get({s}, {d}))", .{ pg_type, index });
     } else {
-        try appendFmt(allocator, buf, "row.get({s}, {d})", .{ pg_type, index });
+        try appendFmt(allocator, buf, "try row.get({s}, {d})", .{ pg_type, index });
     }
 
     try buf.appendSlice(allocator, ",\n");
@@ -784,10 +785,11 @@ test "generate one query" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "pub fn getEmail(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "pool.row(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "|*row|") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "defer row.deinit()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "|r|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "var row = r;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "defer row.deinit() catch {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "return null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "allocator.dupe(u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "allocator.dupe(u8, try row.get(") != null);
 }
 
 test "generate exec query" {
