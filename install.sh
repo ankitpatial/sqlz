@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-REPO="ankitpatial/zqlc"
+REPO="ankitpatial/sqlz"
 INSTALL_DIR="/usr/local/bin"
 
 # Detect OS
@@ -32,25 +32,25 @@ fi
 echo "Latest version: $TAG"
 
 # Download
-URL="https://github.com/${REPO}/releases/download/${TAG}/zqlc-${OS}-${ARCH}.tar.gz"
+URL="https://github.com/${REPO}/releases/download/${TAG}/sqlz-${OS}-${ARCH}.tar.gz"
 echo "Downloading ${URL}..."
-curl -sfL -o /tmp/zqlc.tar.gz "$URL"
+curl -sfL -o /tmp/sqlz.tar.gz "$URL"
 
 # Extract
-tar -xzf /tmp/zqlc.tar.gz -C /tmp zqlc
+tar -xzf /tmp/sqlz.tar.gz -C /tmp sqlz
 
 # Install
 if [ -w "$INSTALL_DIR" ]; then
-  mv /tmp/zqlc "$INSTALL_DIR/zqlc"
+  mv /tmp/sqlz "$INSTALL_DIR/sqlz"
 else
   echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-  sudo mv /tmp/zqlc "$INSTALL_DIR/zqlc"
+  sudo mv /tmp/sqlz "$INSTALL_DIR/sqlz"
 fi
 
-chmod +x "$INSTALL_DIR/zqlc"
+chmod +x "$INSTALL_DIR/sqlz"
 
 # Clean up
-rm -f /tmp/zqlc.tar.gz
+rm -f /tmp/sqlz.tar.gz
 
-echo "zqlc ${TAG} installed to ${INSTALL_DIR}/zqlc"
-echo "Run 'zqlc --help' to get started."
+echo "sqlz ${TAG} installed to ${INSTALL_DIR}/sqlz"
+echo "Run 'sqlz --help' to get started."

@@ -1,7 +1,7 @@
 .{
-    .name = .zqlc,
+    .name = .sqlz,
     .version = "0.1.0",
-    .fingerprint = 0x6d0689cad6824183,
+    .fingerprint = 0x74656e802dbf950e,
     .minimum_zig_version = "0.15.0",
     .paths = .{
         "build.zig",

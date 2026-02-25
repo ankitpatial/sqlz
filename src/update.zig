@@ -1,11 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Single source of truth for the zqlc version.
-pub const version = "0.2.5";
+/// Single source of truth for the sqlz version.
+pub const version = "0.3.0";
 
 /// GitHub repository path.
-const repo = "ankitpatial/zqlc";
+const repo = "ankitpatial/sqlz";
 
 pub const UpdateError = error{
     UnsupportedPlatform,
@@ -52,9 +52,9 @@ pub fn archiveExt() []const u8 {
 /// Constructs the full GitHub release download URL for the given tag.
 /// The caller owns the returned memory.
 ///
-/// Example result: "https://github.com/ankitpatial/zqlc/releases/download/v0.2.0/zqlc-macos-aarch64.tar.gz"
+/// Example result: "https://github.com/ankitpatial/sqlz/releases/download/v0.2.0/sqlz-macos-aarch64.tar.gz"
 pub fn buildDownloadUrl(allocator: std.mem.Allocator, tag: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}/zqlc-{s}{s}", .{
+    return std.fmt.allocPrint(allocator, "https://github.com/{s}/releases/download/{s}/sqlz-{s}{s}", .{
         repo,
         tag,
         platformString(),
@@ -89,7 +89,7 @@ test "buildDownloadUrl constructs correct URL" {
     defer allocator.free(url);
 
     // Verify it starts with the expected prefix
-    try std.testing.expect(std.mem.startsWith(u8, url, "https://github.com/ankitpatial/zqlc/releases/download/v0.2.0/zqlc-"));
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://github.com/ankitpatial/sqlz/releases/download/v0.2.0/sqlz-"));
 
     // Verify it contains the platform string
     try std.testing.expect(std.mem.indexOf(u8, url, platformString()) != null);
@@ -224,7 +224,7 @@ pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool
 
     // 7. Print success
     if (use_color) try stderr.writeAll("\x1b[32m");
-    try stderr.print("Updated zqlc v{s} -> {s}\n", .{ version, latest_tag });
+    try stderr.print("Updated sqlz v{s} -> {s}\n", .{ version, latest_tag });
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
@@ -236,8 +236,8 @@ pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool
 /// the current executable in-place.
 fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *std.Io.Writer, use_color: bool) !void {
     const is_windows = builtin.os.tag == .windows;
-    const archive_path = if (is_windows) "C:\\Temp\\zqlc-update.zip" else "/tmp/zqlc-update.tar.gz";
-    const extracted_binary = if (is_windows) "C:\\Temp\\zqlc.exe" else "/tmp/zqlc";
+    const archive_path = if (is_windows) "C:\\Temp\\sqlz-update.zip" else "/tmp/sqlz-update.tar.gz";
+    const extracted_binary = if (is_windows) "C:\\Temp\\sqlz.exe" else "/tmp/sqlz";
 
     // 1. Download the archive
     if (use_color) try stderr.writeAll("\x1b[36m");
@@ -269,7 +269,7 @@ fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *st
 
     if (is_windows) {
         // Windows: use PowerShell to extract
-        const ps_cmd = "Expand-Archive -Force -Path 'C:\\Temp\\zqlc-update.zip' -DestinationPath 'C:\\Temp'";
+        const ps_cmd = "Expand-Archive -Force -Path 'C:\\Temp\\sqlz-update.zip' -DestinationPath 'C:\\Temp'";
         const ext_result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "powershell", "-NoProfile", "-Command", ps_cmd },
@@ -289,7 +289,7 @@ fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *st
         // Unix: use tar to extract
         const ext_result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{ "tar", "-xzf", archive_path, "-C", "/tmp", "zqlc" },
+            .argv = &.{ "tar", "-xzf", archive_path, "-C", "/tmp", "sqlz" },
         }) catch {
             return error.ExtractionFailed;
         };

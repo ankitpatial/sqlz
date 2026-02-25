@@ -5,20 +5,20 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Library module
-    const lib_mod = b.addModule("zqlc", .{
+    const lib_mod = b.addModule("sqlz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
 
     // Executable
     const exe = b.addExecutable(.{
-        .name = "zqlc",
+        .name = "sqlz",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zqlc", .module = lib_mod },
+                .{ .name = "sqlz", .module = lib_mod },
             },
         }),
     });
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run zqlc");
+    const run_step = b.step("run", "Run sqlz");
     run_step.dependOn(&run_cmd.step);
 
     // Tests

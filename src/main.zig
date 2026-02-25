@@ -1,5 +1,5 @@
 const std = @import("std");
-const lib = @import("zqlc");
+const lib = @import("sqlz");
 
 const update = lib.update;
 const version = update.version;
@@ -51,7 +51,7 @@ pub fn main() !void {
             try stdout.flush();
             return;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            try stdout.print("zqlc {s}\n", .{version});
+            try stdout.print("sqlz {s}\n", .{version});
             try stdout.flush();
             return;
         } else if (std.mem.eql(u8, arg, "--src")) {
@@ -642,14 +642,14 @@ fn loadDotEnvValue(allocator: std.mem.Allocator, path: []const u8, key: []const 
 
 fn printUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
-        \\zqlc - Type-safe SQL code generation for Zig
+        \\sqlz - Type-safe SQL code generation for Zig
         \\
-        \\Usage: zqlc <command> --src <dir> --dest <dir>
+        \\Usage: sqlz <command> --src <dir> --dest <dir>
         \\
         \\Commands:
         \\  generate    Generate Zig code from SQL files
         \\  check       Check if generated files are up to date
-        \\  update      Update zqlc to the latest version
+        \\  update      Update sqlz to the latest version
         \\
         \\Options:
         \\  --src <dir>    Directory containing .sql files (required)
@@ -664,7 +664,7 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\  Can also be set in a .env file in the project root.
         \\
         \\Example:
-        \\  zqlc generate --src db/sql/ --dest db/query/
+        \\  sqlz generate --src db/sql/ --dest db/query/
         \\
     );
 }

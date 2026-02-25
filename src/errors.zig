@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// All error categories for zqlc.
+/// All error categories for sqlz.
 pub const Error = union(enum) {
     connection: ConnectionError,
     auth: AuthError,

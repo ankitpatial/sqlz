@@ -1,4 +1,4 @@
-// zqlc: Type-safe SQL code generation for Zig.
+// sqlz: Type-safe SQL code generation for Zig.
 //
 // Library root — re-exports public modules.
 

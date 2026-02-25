@@ -1,5 +1,5 @@
--- Example schema for zqlc demonstration.
--- Run this against your PostgreSQL database before running zqlc.
+-- Example schema for sqlz demonstration.
+-- Run this against your PostgreSQL database before running sqlz.
 --
 --   psql -f src/example/schema.sql
 

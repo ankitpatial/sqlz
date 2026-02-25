@@ -57,12 +57,12 @@ jobs:
 
             case "$triple" in
               *-windows)
-                archive="zqlc-${triple#*-}-${triple%%-*}.zip"
-                (cd zig-out/bin && zip "../../dist/$archive" zqlc.exe)
+                archive="sqlz-${triple#*-}-${triple%%-*}.zip"
+                (cd zig-out/bin && zip "../../dist/$archive" sqlz.exe)
                 ;;
               *)
-                archive="zqlc-${triple#*-}-${triple%%-*}.tar.gz"
-                tar -czf "dist/$archive" -C zig-out/bin zqlc
+                archive="sqlz-${triple#*-}-${triple%%-*}.tar.gz"
+                tar -czf "dist/$archive" -C zig-out/bin sqlz
                 ;;
             esac
 
