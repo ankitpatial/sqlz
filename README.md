@@ -8,6 +8,7 @@ Reads `.sql` files, introspects a live PostgreSQL database, and generates Zig st
 
 - Zig 0.15+
 - A running PostgreSQL database
+- [pg.zig](https://github.com/karlseguin/pg.zig) — the generated code uses `pg.zig` as the PostgreSQL client library. Your project must have it as a dependency (`@import("pg")`).
 
 ## Install
 
@@ -206,6 +207,35 @@ pub fn updateUser(pool: *pg.Pool, allocator: std.mem.Allocator, params: UpdateUs
     // ...
 }
 ```
+
+### Named parameters
+
+Use `@name` syntax (sqlc-compatible) to give meaningful names to query parameters instead of positional `$1`, `$2`:
+
+```sql
+-- name: SearchPosts :many
+SELECT p.id, p.title, p.body, u.name AS author_name
+FROM posts p
+JOIN users u ON u.id = p.user_id
+WHERE (@author_id::int IS NULL OR p.user_id = @author_id)
+  AND (@keyword::text IS NULL OR p.title ILIKE '%' || @keyword || '%')
+ORDER BY p.created_at DESC
+LIMIT @limit
+OFFSET @offset;
+```
+
+Generates a clean `Params` struct with the exact names you specified:
+
+```zig
+pub const SearchPostsParams = struct {
+    author_id: i32,
+    keyword: []const u8,
+    limit: i64,
+    offset: i64,
+};
+```
+
+Repeated `@name` references (like `@author_id` above) map to the same `$N` positional parameter — the value is sent once and reused by PostgreSQL.
 
 ## Type mappings
 

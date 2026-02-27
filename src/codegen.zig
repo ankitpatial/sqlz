@@ -317,10 +317,10 @@ fn emitExecRowsFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q
         null;
     defer if (params_struct_name) |n| allocator.free(n);
 
-    // pub fn funcName(pool: *pg.Pool, ...) !?usize {
+    // pub fn funcName(pool: *pg.Pool, ...) !?i64 {
     try appendFmt(allocator, buf, "pub fn {s}(pool: *pg.Pool", .{func_name});
     try emitFuncParams(allocator, buf, q.params, params_struct_name, use_helper);
-    try buf.appendSlice(allocator, ") !?usize {\n");
+    try buf.appendSlice(allocator, ") !?i64 {\n");
 
     // return pool.exec(\\SQL, .{params});
     try buf.appendSlice(allocator, "    return pool.exec(\n");
@@ -840,7 +840,7 @@ test "generate execrows query" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "pub fn softDeleteUser(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "pool.exec(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, ") !?usize {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ") !?i64 {") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "return pool.exec(") != null);
 }
 

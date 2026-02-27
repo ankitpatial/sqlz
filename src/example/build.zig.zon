@@ -1,0 +1,12 @@
+.{
+    .name = .example,
+    .version = "0.0.0",
+    .fingerprint = 0x6eec9b9f3fbd500d,
+    .paths = .{""},
+    .dependencies = .{
+        .pg = .{
+            .url = "https://github.com/karlseguin/pg.zig/archive/e58b318b7867ef065b3135983f829219c5eef891.tar.gz",
+            .hash = "pg-0.0.0-Wp_7gXFoBgD0fQ72WICKa-bxLga03AXXQ3BbIsjjohQ3",
+        },
+    },
+}
