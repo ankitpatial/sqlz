@@ -249,9 +249,8 @@ pub fn main() !void {
     defer null_cache.deinit();
 
     var error_count: usize = 0;
-    const output_base = dest_dir;
 
-    // Collect typed query slices for helper.zig generation (when dest_dir is set)
+    // Collect typed query slices for helper.zig generation
     var all_typed_query_slices: std.ArrayList([]const lib.introspect.TypedQuery) = .empty;
     defer all_typed_query_slices.deinit(allocator);
 
@@ -265,8 +264,12 @@ pub fn main() !void {
         all_typed_queries.deinit(allocator);
     }
 
-    for (groups.items) |*group| {
-        // Parse SQL files into untyped queries
+    // Track which groups succeeded introspection (by index into groups.items)
+    var successful_group_indices: std.ArrayList(usize) = .empty;
+    defer successful_group_indices.deinit(allocator);
+
+    // --- Pass 1: Parse and introspect all groups ---
+    for (groups.items, 0..) |*group, group_idx| {
         var untyped_queries: std.ArrayList(lib.query.UntypedQuery) = .empty;
         defer untyped_queries.deinit(allocator);
 
@@ -289,8 +292,7 @@ pub fn main() !void {
 
         if (untyped_queries.items.len == 0) continue;
 
-        // Introspect queries against the database
-        var typed_queries = lib.introspect.describeQueries(
+        const typed_queries = lib.introspect.describeQueries(
             allocator,
             &conn,
             untyped_queries.items,
@@ -307,11 +309,34 @@ pub fn main() !void {
             continue;
         };
 
-        // Compute helper_rel_path
-        const helper_rel_path: []const u8 = blk: {
-            // rel_path is e.g. "users/sql.zig", we need relative path from that dir to helper.zig
+        try all_typed_query_slices.append(allocator, typed_queries.items);
+        try all_typed_queries.append(allocator, typed_queries);
+        try successful_group_indices.append(allocator, group_idx);
+    }
+
+    // --- Generate helper.zig (null when no shared types exist) ---
+    const helper_content: ?[]const u8 = if (all_typed_query_slices.items.len > 0)
+        lib.codegen.generateHelper(allocator, all_typed_query_slices.items) catch |err| blk: {
+            const e = lib.errors.Error{ .query_error = .{
+                .file_path = "helper.zig",
+                .message = @errorName(err),
+            } };
+            try e.format(stderr, use_color);
+            try stderr.flush();
+            error_count += 1;
+            break :blk null;
+        }
+    else
+        null;
+    defer if (helper_content) |hc| allocator.free(hc);
+
+    // --- Pass 2: Generate, format, and write per-module code ---
+    for (successful_group_indices.items, all_typed_query_slices.items) |group_idx, typed_qs| {
+        const group = &groups.items[group_idx];
+
+        // Only compute helper_rel_path when helper.zig will be generated
+        const helper_rel_path: ?[]const u8 = if (helper_content != null) blk: {
             const rel_dir = std.fs.path.dirname(group.rel_path) orelse ".";
-            // Count depth to compute "../" prefix
             var depth: usize = 0;
             if (!std.mem.eql(u8, rel_dir, ".")) {
                 var parts = std.mem.splitScalar(u8, rel_dir, std.fs.path.sep);
@@ -325,11 +350,12 @@ pub fn main() !void {
                 try rel_buf.appendSlice(allocator, "helper.zig");
                 break :blk try rel_buf.toOwnedSlice(allocator);
             }
+        } else null;
+        defer if (helper_rel_path) |hrp| {
+            if (!std.mem.eql(u8, hrp, "helper.zig")) allocator.free(hrp);
         };
-        defer if (!std.mem.eql(u8, helper_rel_path, "helper.zig")) allocator.free(helper_rel_path);
 
-        // Generate Zig code
-        const generated = lib.codegen.generate(allocator, typed_queries.items, helper_rel_path) catch |err| {
+        const generated = lib.codegen.generate(allocator, typed_qs, helper_rel_path) catch |err| {
             const e = lib.errors.Error{ .query_error = .{
                 .file_path = group.output_path,
                 .message = @errorName(err),
@@ -337,21 +363,14 @@ pub fn main() !void {
             try e.format(stderr, use_color);
             try stderr.flush();
             error_count += 1;
-            for (typed_queries.items) |*tq| tq.deinit(allocator);
-            typed_queries.deinit(allocator);
             continue;
         };
         defer allocator.free(generated);
-
-        // Store typed queries for helper generation
-        try all_typed_query_slices.append(allocator, typed_queries.items);
-        try all_typed_queries.append(allocator, typed_queries);
 
         const output_filename = std.fs.path.basename(group.output_path);
 
         switch (config.mode.?) {
             .generate => {
-                // Ensure output directory exists (mkpath for nested dirs)
                 std.fs.cwd().makePath(group.parent_dir) catch {
                     const e2 = lib.errors.Error{ .file = .{
                         .path = group.parent_dir,
@@ -402,7 +421,6 @@ pub fn main() !void {
                 try stderr.flush();
             },
             .check => {
-                // Compare with existing file
                 const existing = std.fs.cwd().openFile(group.output_path, .{}) catch {
                     try stderr.print("  {s}: file does not exist (would be generated)\n", .{group.output_path});
                     try stderr.flush();
@@ -430,21 +448,24 @@ pub fn main() !void {
         }
     }
 
-    // Generate helper.zig and root.zig
-    if (error_count == 0) {
-        const helper_content = lib.codegen.generateHelper(allocator, all_typed_query_slices.items) catch |err| {
-            const e = lib.errors.Error{ .query_error = .{
-                .file_path = "helper.zig",
-                .message = @errorName(err),
-            } };
-            try e.format(stderr, use_color);
-            try stderr.flush();
-            error_count += 1;
-            return;
-        };
-        defer allocator.free(helper_content);
+    // --- Write helper.zig (if needed) and root.zig ---
+    if (successful_group_indices.items.len > 0) {
+        if (helper_content) |hc| {
+            switch (config.mode.?) {
+                .generate => try writeOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
+                .check => try checkOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
+                .update => unreachable,
+            }
+        }
 
-        const root_content = lib.codegen.generateRoot(allocator, groups.items) catch |err| {
+        // Build the list of successful groups for root.zig
+        const successful_groups = try allocator.alloc(lib.project.SqlFileGroup, successful_group_indices.items.len);
+        defer allocator.free(successful_groups);
+        for (successful_group_indices.items, 0..) |idx, i| {
+            successful_groups[i] = groups.items[idx];
+        }
+
+        const root_content = lib.codegen.generateRoot(allocator, successful_groups) catch |err| {
             const e = lib.errors.Error{ .query_error = .{
                 .file_path = "root.zig",
                 .message = @errorName(err),
@@ -457,15 +478,20 @@ pub fn main() !void {
         defer allocator.free(root_content);
 
         switch (config.mode.?) {
-            .generate => {
-                try writeOutputFile(allocator, output_base, "helper.zig", helper_content, stderr, use_color, &error_count);
-                try writeOutputFile(allocator, output_base, "root.zig", root_content, stderr, use_color, &error_count);
-            },
-            .check => {
-                try checkOutputFile(allocator, output_base, "helper.zig", helper_content, stderr, use_color, &error_count);
-                try checkOutputFile(allocator, output_base, "root.zig", root_content, stderr, use_color, &error_count);
-            },
+            .generate => try writeOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
+            .check => try checkOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
             .update => unreachable,
+        }
+
+        // Format all generated files with zig fmt
+        if (config.mode.? == .generate) {
+            if (std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "zig", "fmt", dest_dir },
+            })) |fmt_result| {
+                allocator.free(fmt_result.stdout);
+                allocator.free(fmt_result.stderr);
+            } else |_| {}
         }
     }
 

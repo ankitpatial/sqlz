@@ -43,10 +43,20 @@ pub fn generate(allocator: std.mem.Allocator, queries: []const introspect.TypedQ
             try buf.appendSlice(allocator, "pub const Timestamp = i64;\n\n");
         }
 
-        // Enum type definitions (inline when no helper)
-        var enum_iter = enum_types.iterator();
-        while (enum_iter.next()) |entry| {
-            const info = entry.value_ptr.*;
+        // Enum type definitions (inline when no helper) — sorted for deterministic output
+        var enum_names: std.ArrayList([]const u8) = .empty;
+        defer enum_names.deinit(allocator);
+        {
+            var iter = enum_types.iterator();
+            while (iter.next()) |entry| try enum_names.append(allocator, entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, enum_names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        for (enum_names.items) |name| {
+            const info = enum_types.get(name).?;
             const pascal_name = try snakeToPascal(allocator, info.name);
             defer allocator.free(pascal_name);
 
@@ -54,7 +64,7 @@ pub fn generate(allocator: std.mem.Allocator, queries: []const introspect.TypedQ
             for (info.variants) |variant| {
                 const zig_variant = try sanitizeEnumVariant(allocator, variant);
                 defer allocator.free(zig_variant);
-                try appendFmt(allocator, &buf, "    {s},\n", .{zig_variant});
+                try appendFmt(allocator, &buf, "{s},\n", .{zig_variant});
             }
             try buf.appendSlice(allocator, "};\n\n");
         }
@@ -81,7 +91,6 @@ pub fn generate(allocator: std.mem.Allocator, queries: []const introspect.TypedQ
             for (q.columns) |col| {
                 const safe_name = try safeIdentifier(allocator, col.name);
                 defer allocator.free(safe_name);
-                try buf.appendSlice(allocator, "    ");
                 try buf.appendSlice(allocator, safe_name);
                 try buf.appendSlice(allocator, ": ");
                 if (col.nullable) try buf.append(allocator, '?');
@@ -99,7 +108,6 @@ pub fn generate(allocator: std.mem.Allocator, queries: []const introspect.TypedQ
             for (q.params) |param| {
                 const safe_name = try safeIdentifier(allocator, param.name);
                 defer allocator.free(safe_name);
-                try buf.appendSlice(allocator, "    ");
                 try buf.appendSlice(allocator, safe_name);
                 try buf.appendSlice(allocator, ": ");
                 try appendPgFieldType(allocator, &buf, param.zig_type, use_helper);
@@ -122,13 +130,8 @@ pub fn generate(allocator: std.mem.Allocator, queries: []const introspect.TypedQ
 
 /// Generate helper.zig containing shared type definitions (Timestamp, enums)
 /// used across all generated sql.zig modules.
-pub fn generateHelper(allocator: std.mem.Allocator, all_queries: []const []const introspect.TypedQuery) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    try buf.appendSlice(allocator, header);
-    try buf.append(allocator, '\n');
-
+/// Returns null when no shared types exist (no helper.zig needed).
+pub fn generateHelper(allocator: std.mem.Allocator, all_queries: []const []const introspect.TypedQuery) !?[]const u8 {
     // Scan all queries for shared type needs
     var needs_timestamp = false;
     var enum_types = std.StringHashMap(types.ZigType.EnumInfo).init(allocator);
@@ -140,6 +143,15 @@ pub fn generateHelper(allocator: std.mem.Allocator, all_queries: []const []const
             for (q.columns) |c| scanTypeNeeds(c.zig_type, &needs_timestamp, &enum_types) catch {};
         }
     }
+
+    // Nothing to share — skip helper.zig entirely
+    if (!needs_timestamp and enum_types.count() == 0) return null;
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, header);
+    try buf.append(allocator, '\n');
 
     if (needs_timestamp) {
         try buf.appendSlice(allocator, "pub const Timestamp = i64;\n");
@@ -170,12 +182,13 @@ pub fn generateHelper(allocator: std.mem.Allocator, all_queries: []const []const
         for (info.variants) |variant| {
             const zig_variant = try sanitizeEnumVariant(allocator, variant);
             defer allocator.free(zig_variant);
-            try appendFmt(allocator, &buf, "    {s},\n", .{zig_variant});
+            try appendFmt(allocator, &buf, "{s},\n", .{zig_variant});
         }
         try buf.appendSlice(allocator, "};\n");
     }
 
-    return buf.toOwnedSlice(allocator);
+    const slice = try buf.toOwnedSlice(allocator);
+    return slice;
 }
 
 /// Generate root.zig that re-exports all generated zig modules.
@@ -213,29 +226,24 @@ fn emitOneFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q: int
 
     const needs_alloc = columnsNeedDupe(q.columns);
 
-    // pub fn funcName(pool: *pg.Pool, [allocator: std.mem.Allocator,] ...) !?RowStruct {
     try appendFmt(allocator, buf, "pub fn {s}(pool: *pg.Pool", .{func_name});
     if (needs_alloc) try buf.appendSlice(allocator, ", allocator: std.mem.Allocator");
     try emitFuncParams(allocator, buf, q.params, params_struct_name, use_helper);
     try appendFmt(allocator, buf, ") !?{s} {{\n", .{struct_name});
-
-    // if (try pool.row(\\SQL, .{params})) |row| {
-    try buf.appendSlice(allocator, "    if (try pool.row(\n");
-    try emitSqlLiteral(allocator, buf, q.sql, 8);
-    try buf.appendSlice(allocator, "    , ");
+    try buf.appendSlice(allocator, "if (try pool.row(\n");
+    try emitSqlLiteral(allocator, buf, q.sql);
+    try buf.appendSlice(allocator, ", ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
     try buf.appendSlice(allocator, ")) |r| {\n");
-    try buf.appendSlice(allocator, "        var row = r;\n");
-    try buf.appendSlice(allocator, "        defer row.deinit() catch {};\n");
-
-    // return .{ .field = row.get(...), ... };
-    try buf.appendSlice(allocator, "        return .{\n");
+    try buf.appendSlice(allocator, "var row = r;\n");
+    try buf.appendSlice(allocator, "defer row.deinit() catch {};\n");
+    try buf.appendSlice(allocator, "return .{\n");
     for (q.columns, 0..) |col, i| {
-        try emitRowFieldAssignment(allocator, buf, col, i, "            ", use_helper);
+        try emitRowFieldAssignment(allocator, buf, col, i, use_helper);
     }
-    try buf.appendSlice(allocator, "        };\n");
-    try buf.appendSlice(allocator, "    }\n");
-    try buf.appendSlice(allocator, "    return null;\n");
+    try buf.appendSlice(allocator, "};\n");
+    try buf.appendSlice(allocator, "}\n");
+    try buf.appendSlice(allocator, "return null;\n");
     try buf.appendSlice(allocator, "}\n\n");
 }
 
@@ -252,32 +260,25 @@ fn emitManyFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q: in
         null;
     defer if (params_struct_name) |n| allocator.free(n);
 
-    // pub fn funcName(pool: *pg.Pool, allocator: std.mem.Allocator, ...) ![]RowStruct {
     try appendFmt(allocator, buf, "pub fn {s}(pool: *pg.Pool, allocator: std.mem.Allocator", .{func_name});
     try emitFuncParams(allocator, buf, q.params, params_struct_name, use_helper);
     try appendFmt(allocator, buf, ") ![]{s} {{\n", .{struct_name});
-
-    // var result = try pool.query(\\SQL, .{params});
-    try buf.appendSlice(allocator, "    var result = try pool.query(\n");
-    try emitSqlLiteral(allocator, buf, q.sql, 8);
-    try buf.appendSlice(allocator, "    , ");
+    try buf.appendSlice(allocator, "var result = try pool.query(\n");
+    try emitSqlLiteral(allocator, buf, q.sql);
+    try buf.appendSlice(allocator, ", ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
     try buf.appendSlice(allocator, ");\n");
-    try buf.appendSlice(allocator, "    defer result.deinit();\n\n");
-
-    // var rows: std.ArrayList(RowStruct) = .empty;
-    try appendFmt(allocator, buf, "    var rows: std.ArrayList({s}) = .empty;\n", .{struct_name});
-    try buf.appendSlice(allocator, "    errdefer rows.deinit(allocator);\n\n");
-
-    // while (try result.next()) |row| { ... }
-    try buf.appendSlice(allocator, "    while (try result.next()) |row| {\n");
-    try buf.appendSlice(allocator, "        try rows.append(allocator, .{\n");
+    try buf.appendSlice(allocator, "defer result.deinit();\n");
+    try appendFmt(allocator, buf, "var rows: std.ArrayList({s}) = .empty;\n", .{struct_name});
+    try buf.appendSlice(allocator, "errdefer rows.deinit(allocator);\n");
+    try buf.appendSlice(allocator, "while (try result.next()) |row| {\n");
+    try buf.appendSlice(allocator, "try rows.append(allocator, .{\n");
     for (q.columns, 0..) |col, i| {
-        try emitRowFieldAssignment(allocator, buf, col, i, "            ", use_helper);
+        try emitRowFieldAssignment(allocator, buf, col, i, use_helper);
     }
-    try buf.appendSlice(allocator, "        });\n");
-    try buf.appendSlice(allocator, "    }\n");
-    try buf.appendSlice(allocator, "    return rows.toOwnedSlice(allocator);\n");
+    try buf.appendSlice(allocator, "});\n");
+    try buf.appendSlice(allocator, "}\n");
+    try buf.appendSlice(allocator, "return rows.toOwnedSlice(allocator);\n");
     try buf.appendSlice(allocator, "}\n\n");
 }
 
@@ -292,15 +293,12 @@ fn emitExecFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q: in
         null;
     defer if (params_struct_name) |n| allocator.free(n);
 
-    // pub fn funcName(pool: *pg.Pool, ...) !void {
     try appendFmt(allocator, buf, "pub fn {s}(pool: *pg.Pool", .{func_name});
     try emitFuncParams(allocator, buf, q.params, params_struct_name, use_helper);
     try buf.appendSlice(allocator, ") !void {\n");
-
-    // _ = try pool.exec(\\SQL, .{params});
-    try buf.appendSlice(allocator, "    _ = try pool.exec(\n");
-    try emitSqlLiteral(allocator, buf, q.sql, 8);
-    try buf.appendSlice(allocator, "    , ");
+    try buf.appendSlice(allocator, "_ = try pool.exec(\n");
+    try emitSqlLiteral(allocator, buf, q.sql);
+    try buf.appendSlice(allocator, ", ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
     try buf.appendSlice(allocator, ");\n");
     try buf.appendSlice(allocator, "}\n\n");
@@ -317,15 +315,12 @@ fn emitExecRowsFunction(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), q
         null;
     defer if (params_struct_name) |n| allocator.free(n);
 
-    // pub fn funcName(pool: *pg.Pool, ...) !?i64 {
     try appendFmt(allocator, buf, "pub fn {s}(pool: *pg.Pool", .{func_name});
     try emitFuncParams(allocator, buf, q.params, params_struct_name, use_helper);
-    try buf.appendSlice(allocator, ") !?i64 {\n");
-
-    // return pool.exec(\\SQL, .{params});
-    try buf.appendSlice(allocator, "    return pool.exec(\n");
-    try emitSqlLiteral(allocator, buf, q.sql, 8);
-    try buf.appendSlice(allocator, "    , ");
+    try buf.appendSlice(allocator, ") !?usize {\n");
+    try buf.appendSlice(allocator, "return pool.exec(\n");
+    try emitSqlLiteral(allocator, buf, q.sql);
+    try buf.appendSlice(allocator, ", ");
     try emitParamsTuple(allocator, buf, q.params, use_struct);
     try buf.appendSlice(allocator, ");\n");
     try buf.appendSlice(allocator, "}\n\n");
@@ -357,30 +352,29 @@ fn emitFuncParams(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), params:
     }
 }
 
-/// Emit the params tuple: .{param1, param2, ...}
+/// Emit the params tuple — zig fmt handles layout.
+/// Trailing comma triggers zig fmt multi-line; omit it for <=5 fields to keep inline.
 fn emitParamsTuple(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), params: []const introspect.Param, use_struct: bool) !void {
     try buf.appendSlice(allocator, ".{");
     for (params, 0..) |param, i| {
         const safe_name = try safeIdentifier(allocator, param.name);
         defer allocator.free(safe_name);
-        if (i > 0) try buf.appendSlice(allocator, ", ");
         if (use_struct) try buf.appendSlice(allocator, "params.");
         try buf.appendSlice(allocator, safe_name);
+        if (i + 1 < params.len) try buf.appendSlice(allocator, ", ");
     }
+    if (params.len > 5) try buf.append(allocator, ',');
     try buf.appendSlice(allocator, "}");
 }
 
 /// Emit SQL as a Zig multiline string literal using \\ prefixed lines.
-fn emitSqlLiteral(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8, indent: usize) !void {
+fn emitSqlLiteral(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8) !void {
     var lines = std.mem.splitScalar(u8, sql, '\n');
     var first = true;
     while (lines.next()) |line| {
         if (!first) try buf.append(allocator, '\n');
         first = false;
-        // Emit indent spaces
-        for (0..indent) |_| try buf.append(allocator, ' ');
         try buf.appendSlice(allocator, "\\\\");
-        // Strip \r from line endings
         const clean = std.mem.trimRight(u8, line, "\r");
         if (clean.len > 0) {
             try buf.append(allocator, ' ');
@@ -391,10 +385,9 @@ fn emitSqlLiteral(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []
 }
 
 /// Emit a row field assignment: .name = row.get(T, idx), with dupe for strings.
-fn emitRowFieldAssignment(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), col: introspect.Column, index: usize, indent: []const u8, use_helper: bool) !void {
+fn emitRowFieldAssignment(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), col: introspect.Column, index: usize, use_helper: bool) !void {
     const safe_name = try safeIdentifier(allocator, col.name);
     defer allocator.free(safe_name);
-    try buf.appendSlice(allocator, indent);
     try buf.append(allocator, '.');
     try buf.appendSlice(allocator, safe_name);
     try buf.appendSlice(allocator, " = ");
@@ -410,19 +403,19 @@ fn emitRowFieldAssignment(allocator: std.mem.Allocator, buf: *std.ArrayList(u8),
     if (col.nullable and is_enum) {
         const pascal = try snakeToPascal(allocator, col.zig_type.pg_enum.name);
         defer allocator.free(pascal);
-        try appendFmt(allocator, buf, "if (try row.get(?[]u8, {d})) |v| (std.meta.stringToEnum({s}{s}, v) orelse return error.InvalidEnumValue) else null", .{ index, prefix, pascal });
+        try appendFmt(allocator, buf, "if (row.get(?[]u8, {d})) |v| (std.meta.stringToEnum({s}{s}, v) orelse return error.InvalidEnumValue) else null", .{ index, prefix, pascal });
     } else if (col.nullable and needs_dupe) {
-        try appendFmt(allocator, buf, "if (try row.get(?{s}, {d})) |v| try allocator.dupe(u8, v) else null", .{ pg_type, index });
+        try appendFmt(allocator, buf, "if (row.get(?{s}, {d})) |v| try allocator.dupe(u8, v) else null", .{ pg_type, index });
     } else if (col.nullable) {
-        try appendFmt(allocator, buf, "try row.get(?{s}, {d})", .{ pg_type, index });
+        try appendFmt(allocator, buf, "row.get(?{s}, {d})", .{ pg_type, index });
     } else if (is_enum) {
         const pascal = try snakeToPascal(allocator, col.zig_type.pg_enum.name);
         defer allocator.free(pascal);
-        try appendFmt(allocator, buf, "std.meta.stringToEnum({s}{s}, try row.get([]u8, {d})) orelse return error.InvalidEnumValue", .{ prefix, pascal, index });
+        try appendFmt(allocator, buf, "std.meta.stringToEnum({s}{s}, row.get([]u8, {d})) orelse return error.InvalidEnumValue", .{ prefix, pascal, index });
     } else if (needs_dupe) {
-        try appendFmt(allocator, buf, "try allocator.dupe(u8, try row.get({s}, {d}))", .{ pg_type, index });
+        try appendFmt(allocator, buf, "try allocator.dupe(u8, row.get({s}, {d}))", .{ pg_type, index });
     } else {
-        try appendFmt(allocator, buf, "try row.get({s}, {d})", .{ pg_type, index });
+        try appendFmt(allocator, buf, "row.get({s}, {d})", .{ pg_type, index });
     }
 
     try buf.appendSlice(allocator, ",\n");
@@ -439,7 +432,7 @@ fn columnsNeedDupe(columns: []const introspect.Column) bool {
 /// Whether a type needs allocator.dupe when reading from pg.zig row.
 fn typeNeedsDupe(zig_type: types.ZigType) bool {
     return switch (zig_type) {
-        .text, .bytea, .uuid, .json, .pg_enum => true,
+        .text, .bytea, .uuid, .json => true,
         .optional => |inner| typeNeedsDupe(inner.*),
         .unknown => true,
         else => false,
@@ -789,7 +782,7 @@ test "generate one query" {
     try std.testing.expect(std.mem.indexOf(u8, result, "var row = r;") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "defer row.deinit() catch {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "return null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "allocator.dupe(u8, try row.get(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "allocator.dupe(u8, row.get(") != null);
 }
 
 test "generate exec query" {
@@ -840,8 +833,33 @@ test "generate execrows query" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "pub fn softDeleteUser(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "pool.exec(") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, ") !?i64 {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ") !?usize {") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "return pool.exec(") != null);
+}
+
+test "row.get handles nullable and non-nullable columns" {
+    const allocator = std.testing.allocator;
+
+    var columns = try allocator.alloc(introspect.Column, 2);
+    defer allocator.free(columns);
+    columns[0] = .{ .name = "user_id", .zig_type = .i64_type, .nullable = true, .table_oid = 0, .column_attr = 0 };
+    columns[1] = .{ .name = "id", .zig_type = .i32_type, .nullable = false, .table_oid = 0, .column_attr = 0 };
+
+    const queries = [_]introspect.TypedQuery{.{
+        .name = "ValidateToken",
+        .file_path = "sql/validate_token.sql",
+        .sql = "SELECT user_id, id FROM tokens WHERE id = $1",
+        .comment = null,
+        .kind = .one,
+        .params = &.{},
+        .columns = columns,
+    }};
+
+    const result = try generate(allocator, &queries, null);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "row.get(?i64, 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "row.get(i32, 1)") != null);
 }
 
 test "sanitizeEnumVariant" {

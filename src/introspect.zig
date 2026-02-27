@@ -208,12 +208,21 @@ fn describeOne(
         return error.QueryIntrospectionFailed;
     }
 
-    // Build params — use explicit names from @name syntax if available,
-    // otherwise fall back to heuristic extraction from SQL context.
-    const param_names = if (named) |n|
-        n.names
-    else
-        try extractParamNames(allocator, uq.sql, param_oids.len);
+    // Build param names — merge positional and @name sources when both exist.
+    const param_names = if (named) |n| blk: {
+        const total = n.positional_count + n.names.len;
+        const all_names = try allocator.alloc([]const u8, total);
+        // Extract names for pre-existing positional $N params from original SQL
+        const pos_names = try extractParamNames(allocator, uq.sql, n.positional_count);
+        for (0..n.positional_count) |idx| all_names[idx] = pos_names[idx];
+        allocator.free(pos_names);
+        // Named @params fill remaining slots
+        for (0..n.names.len) |idx| all_names[n.positional_count + idx] = n.names[idx];
+        break :blk try deduplicateParamNames(allocator, all_names);
+    } else try deduplicateParamNames(
+        allocator,
+        try extractParamNames(allocator, uq.sql, param_oids.len),
+    );
 
     const params = try allocator.alloc(Param, param_oids.len);
     for (param_oids, 0..) |param_oid, i| {
@@ -382,6 +391,7 @@ fn resolveEnumType(
 const NamedParamResult = struct {
     sql: []const u8,
     names: [][]const u8,
+    positional_count: usize, // number of pre-existing $N params
 };
 
 /// Replace sqlc-style @name named parameters with $N positional parameters.
@@ -400,6 +410,49 @@ pub fn replaceNamedParams(allocator: std.mem.Allocator, sql: []const u8) !?Named
         }
     }
     if (!has_named) return null;
+
+    // Pre-scan: find the highest existing $N positional parameter
+    var max_positional: usize = 0;
+    {
+        var j: usize = 0;
+        while (j < sql.len) {
+            // Skip string literals
+            if (sql[j] == '\'') {
+                j += 1;
+                while (j < sql.len) {
+                    if (sql[j] == '\'') {
+                        if (j + 1 < sql.len and sql[j + 1] == '\'') {
+                            j += 2;
+                            continue;
+                        }
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                continue;
+            }
+            // Skip line comments
+            if (sql[j] == '-' and j + 1 < sql.len and sql[j + 1] == '-') {
+                while (j < sql.len and sql[j] != '\n') j += 1;
+                continue;
+            }
+            // Check for $N
+            if (sql[j] == '$' and j + 1 < sql.len and std.ascii.isDigit(sql[j + 1])) {
+                const num_start = j + 1;
+                var num_end = num_start;
+                while (num_end < sql.len and std.ascii.isDigit(sql[num_end])) num_end += 1;
+                const num = std.fmt.parseInt(usize, sql[num_start..num_end], 10) catch {
+                    j = num_end;
+                    continue;
+                };
+                if (num > max_positional) max_positional = num;
+                j = num_end;
+                continue;
+            }
+            j += 1;
+        }
+    }
 
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(allocator);
@@ -453,16 +506,16 @@ pub fn replaceNamedParams(allocator: std.mem.Allocator, sql: []const u8) !?Named
             }
             const name = sql[name_start..name_end];
 
-            // Find existing position or assign a new one
+            // Find existing position or assign a new one (offset by max_positional)
             var pos: usize = 0;
             for (names.items, 0..) |existing, idx| {
                 if (std.mem.eql(u8, existing, name)) {
-                    pos = idx + 1;
+                    pos = max_positional + idx + 1;
                     break;
                 }
             } else {
                 try names.append(allocator, name);
-                pos = names.items.len;
+                pos = max_positional + names.items.len;
             }
 
             // Emit $N
@@ -486,6 +539,7 @@ pub fn replaceNamedParams(allocator: std.mem.Allocator, sql: []const u8) !?Named
     return .{
         .sql = try result.toOwnedSlice(allocator),
         .names = final_names,
+        .positional_count = max_positional,
     };
 }
 
@@ -541,13 +595,11 @@ pub fn extractParamNames(allocator: std.mem.Allocator, sql: []const u8, param_co
         // Already named (e.g., from INSERT column list)
         if (names[idx].len > 0) continue;
 
-        // Look backward for context: skip whitespace/operators to find a preceding identifier
+        // Look backward for context (handles column = $N, LIMIT $N, OFFSET $N, etc.)
         if (findPrecedingContext(sql, i)) |ctx_name| {
             names[idx] = ctx_name;
             continue;
         }
-
-        // Look forward for keyword context (LIMIT $N, OFFSET $N matched via preceding)
     }
 
     // Fill in any remaining unnamed params with fallback names
@@ -562,19 +614,27 @@ pub fn extractParamNames(allocator: std.mem.Allocator, sql: []const u8, param_co
     return names;
 }
 
+/// Deduplicate parameter names by appending _1, _2, ... to collisions.
+/// Takes ownership of the input slice and its strings — the caller must
+/// not free them separately.
+fn deduplicateParamNames(allocator: std.mem.Allocator, names: [][]const u8) ![][]const u8 {
+    for (names, 0..) |name, i| {
+        var suffix: usize = 1;
+        for (i + 1..names.len) |j| {
+            if (std.mem.eql(u8, names[j], name)) {
+                const new_name = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ name, suffix });
+                allocator.free(names[j]);
+                names[j] = new_name;
+                suffix += 1;
+            }
+        }
+    }
+    return names;
+}
+
 /// Try to match INSERT INTO t (col1, col2, ...) VALUES ($1, $2, ...) and
 /// assign names positionally from the column list.
 fn tryInsertColumns(sql: []const u8, names: [][]const u8) bool {
-    const upper = struct {
-        fn eqlFold(a: []const u8, b: []const u8) bool {
-            if (a.len != b.len) return false;
-            for (a, b) |ca, cb| {
-                if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-            }
-            return true;
-        }
-    };
-
     // Find "INSERT" then "INTO" then table, then "(" column list ")"
     // then "VALUES" then "(" $1, $2 ... ")"
     var pos: usize = 0;
@@ -648,7 +708,6 @@ fn tryInsertColumns(sql: []const u8, names: [][]const u8) bool {
         }
     }
 
-    _ = upper;
     return col_count > 0;
 }
 
@@ -1017,10 +1076,10 @@ test "replaceNamedParams adjacent to parentheses and operators" {
     try std.testing.expectEqualStrings("max_age", r.names[2]);
 }
 
-test "replaceNamedParams mixed positional and named is handled" {
+test "replaceNamedParams mixed positional and named avoids collision" {
     const allocator = std.testing.allocator;
 
-    // If someone mixes $1 and @name, @name still gets replaced
+    // @name should be assigned $2 (after existing $1), not $1
     const r = (try replaceNamedParams(allocator,
         "WHERE id = $1 AND name = @name",
     )).?;
@@ -1029,9 +1088,68 @@ test "replaceNamedParams mixed positional and named is handled" {
         for (r.names) |n| allocator.free(n);
         allocator.free(r.names);
     }
-    try std.testing.expectEqualStrings("WHERE id = $1 AND name = $1", r.sql);
+    try std.testing.expectEqualStrings("WHERE id = $1 AND name = $2", r.sql);
     try std.testing.expectEqual(@as(usize, 1), r.names.len);
     try std.testing.expectEqualStrings("name", r.names[0]);
+    try std.testing.expectEqual(@as(usize, 1), r.positional_count);
+}
+
+test "replaceNamedParams lockAccount-style mixed params" {
+    const allocator = std.testing.allocator;
+
+    const r = (try replaceNamedParams(allocator,
+        "UPDATE accounts SET locked_until_at = @locked_until_at WHERE id = $1 RETURNING id, locked_until_at",
+    )).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+    // @locked_until_at should become $2, not $1
+    try std.testing.expectEqualStrings(
+        "UPDATE accounts SET locked_until_at = $2 WHERE id = $1 RETURNING id, locked_until_at",
+        r.sql,
+    );
+    try std.testing.expectEqual(@as(usize, 1), r.names.len);
+    try std.testing.expectEqualStrings("locked_until_at", r.names[0]);
+    try std.testing.expectEqual(@as(usize, 1), r.positional_count);
+}
+
+test "replaceNamedParams multiple positional and named" {
+    const allocator = std.testing.allocator;
+
+    const r = (try replaceNamedParams(allocator,
+        "WHERE a = $1 AND b = $2 AND c = @foo AND d = @bar",
+    )).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+    // @foo → $3, @bar → $4
+    try std.testing.expectEqualStrings("WHERE a = $1 AND b = $2 AND c = $3 AND d = $4", r.sql);
+    try std.testing.expectEqual(@as(usize, 2), r.names.len);
+    try std.testing.expectEqualStrings("foo", r.names[0]);
+    try std.testing.expectEqualStrings("bar", r.names[1]);
+    try std.testing.expectEqual(@as(usize, 2), r.positional_count);
+}
+
+test "deduplicateParamNames resolves duplicate names" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator,
+        "WHERE age >= $1 AND age <= $2 AND name = $3",
+        3,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+
+    const deduped = try deduplicateParamNames(allocator, names);
+    try std.testing.expectEqualStrings("age", deduped[0]);
+    try std.testing.expectEqualStrings("age_1", deduped[1]);
+    try std.testing.expectEqualStrings("name", deduped[2]);
 }
 
 test "extractParamNames simple WHERE clause" {
