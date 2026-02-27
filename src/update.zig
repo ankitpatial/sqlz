@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Single source of truth for the sqlz version.
-pub const version = "0.3.0";
+pub const version = "0.3.1";
 
 /// GitHub repository path.
 const repo = "ankitpatial/sqlz";

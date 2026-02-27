@@ -358,3 +358,374 @@ test "encode parse message" {
     try std.testing.expectEqual(@as(u8, 'P'), buf.items[0]);
     try std.testing.expect(buf.items.len > 5);
 }
+
+test "encode query message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeQuery(allocator, &buf, "SELECT 1");
+    try std.testing.expectEqual(@as(u8, 'Q'), buf.items[0]);
+    const len = std.mem.readInt(i32, buf.items[1..5], .big);
+    try std.testing.expectEqual(@as(i32, @intCast(buf.items.len - 1)), len);
+    // Should end with null terminator
+    try std.testing.expectEqual(@as(u8, 0), buf.items[buf.items.len - 1]);
+}
+
+test "encode terminate message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeTerminate(allocator, &buf);
+    try std.testing.expectEqual(@as(usize, 5), buf.items.len);
+    try std.testing.expectEqual(@as(u8, 'X'), buf.items[0]);
+    const len = std.mem.readInt(i32, buf.items[1..5], .big);
+    try std.testing.expectEqual(@as(i32, 4), len);
+}
+
+test "encode describe message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeDescribe(allocator, &buf, 'S', "");
+    try std.testing.expectEqual(@as(u8, 'D'), buf.items[0]);
+    // Target byte should be 'S' for statement
+    try std.testing.expectEqual(@as(u8, 'S'), buf.items[5]);
+}
+
+test "encode password message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodePassword(allocator, &buf, "secret");
+    try std.testing.expectEqual(@as(u8, 'p'), buf.items[0]);
+    const len = std.mem.readInt(i32, buf.items[1..5], .big);
+    try std.testing.expectEqual(@as(i32, @intCast(4 + 6 + 1)), len);
+}
+
+test "encode close message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeClose(allocator, &buf, 'S', "stmt");
+    try std.testing.expectEqual(@as(u8, 'C'), buf.items[0]);
+    try std.testing.expectEqual(@as(u8, 'S'), buf.items[5]);
+}
+
+// ─── Backend message decoding tests ──────────────────────────────────────
+
+fn buildBackendMsg(allocator: std.mem.Allocator, msg_type: u8, payload: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte(msg_type);
+    const len: i32 = @intCast(4 + payload.len);
+    try w.writeInt(i32, len, .big);
+    try w.writeAll(payload);
+    return buf.toOwnedSlice(allocator);
+}
+
+test "decode auth_ok" {
+    const allocator = std.testing.allocator;
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(i32, &payload, 0, .big); // auth type 0 = OK
+    const data = try buildBackendMsg(allocator, 'R', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    try std.testing.expectEqual(BackendMsg.auth_ok, result.msg);
+    try std.testing.expectEqual(data.len, result.consumed);
+}
+
+test "decode auth_cleartext" {
+    const allocator = std.testing.allocator;
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(i32, &payload, 3, .big); // auth type 3 = cleartext
+    const data = try buildBackendMsg(allocator, 'R', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    try std.testing.expectEqual(BackendMsg.auth_cleartext, result.msg);
+}
+
+test "decode auth_md5" {
+    const allocator = std.testing.allocator;
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(i32, payload[0..4], 5, .big); // auth type 5 = MD5
+    payload[4] = 0xAA;
+    payload[5] = 0xBB;
+    payload[6] = 0xCC;
+    payload[7] = 0xDD;
+    const data = try buildBackendMsg(allocator, 'R', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .auth_md5 => |salt| {
+            try std.testing.expectEqual(@as(u8, 0xAA), salt[0]);
+            try std.testing.expectEqual(@as(u8, 0xDD), salt[3]);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode ready_for_query" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, 'Z', &.{'I'});
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .ready_for_query => |status| try std.testing.expectEqual(@as(u8, 'I'), status),
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode parse_complete" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, '1', &.{});
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    try std.testing.expectEqual(BackendMsg.parse_complete, result.msg);
+}
+
+test "decode no_data" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, 'n', &.{});
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    try std.testing.expectEqual(BackendMsg.no_data, result.msg);
+}
+
+test "decode parameter_description" {
+    const allocator = std.testing.allocator;
+    // 2 params: OID 23 (int4) and OID 25 (text)
+    var payload: [10]u8 = undefined;
+    std.mem.writeInt(i16, payload[0..2], 2, .big);
+    std.mem.writeInt(u32, payload[2..6], 23, .big);
+    std.mem.writeInt(u32, payload[6..10], 25, .big);
+    const data = try buildBackendMsg(allocator, 't', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .parameter_description => |oids| {
+            defer allocator.free(oids);
+            try std.testing.expectEqual(@as(usize, 2), oids.len);
+            try std.testing.expectEqual(@as(u32, 23), oids[0]);
+            try std.testing.expectEqual(@as(u32, 25), oids[1]);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode row_description" {
+    const allocator = std.testing.allocator;
+    // Build a RowDescription with 1 field: "id"
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeInt(i16, 1, .big); // 1 field
+    try w.writeAll("id"); // field name
+    try w.writeByte(0); // null terminator
+    try w.writeInt(u32, 16384, .big); // table OID
+    try w.writeInt(i16, 1, .big); // column attr
+    try w.writeInt(u32, 23, .big); // type OID (int4)
+    try w.writeInt(i16, 4, .big); // type length
+    try w.writeInt(i32, -1, .big); // type mod
+    try w.writeInt(i16, 0, .big); // format code
+
+    const data = try buildBackendMsg(allocator, 'T', buf.items);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .row_description => |fields| {
+            defer {
+                for (fields) |f| allocator.free(f.name);
+                allocator.free(fields);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fields.len);
+            try std.testing.expectEqualStrings("id", fields[0].name);
+            try std.testing.expectEqual(@as(u32, 23), fields[0].type_oid);
+            try std.testing.expectEqual(@as(u32, 16384), fields[0].table_oid);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode data_row" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeInt(i16, 3, .big); // 3 columns
+    // Column 1: "hello"
+    try w.writeInt(i32, 5, .big);
+    try w.writeAll("hello");
+    // Column 2: NULL
+    try w.writeInt(i32, -1, .big);
+    // Column 3: "42"
+    try w.writeInt(i32, 2, .big);
+    try w.writeAll("42");
+
+    const data = try buildBackendMsg(allocator, 'D', buf.items);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .data_row => |values| {
+            defer {
+                for (values) |v| if (v) |s| allocator.free(s);
+                allocator.free(values);
+            }
+            try std.testing.expectEqual(@as(usize, 3), values.len);
+            try std.testing.expectEqualStrings("hello", values[0].?);
+            try std.testing.expect(values[1] == null);
+            try std.testing.expectEqualStrings("42", values[2].?);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode command_complete" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, 'C', "DELETE 3\x00");
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .command_complete => |tag| {
+            defer allocator.free(tag);
+            try std.testing.expectEqualStrings("DELETE 3", tag);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode error_response" {
+    const allocator = std.testing.allocator;
+    // Build: severity='S' + "ERROR\0" + message='M' + "test error\0" + terminator
+    const payload = "SERROR\x00Mtest error\x00\x00";
+    const data = try buildBackendMsg(allocator, 'E', payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .error_response => |e| {
+            defer {
+                for (e.fields) |f| allocator.free(f.value);
+                allocator.free(e.fields);
+            }
+            try std.testing.expectEqual(@as(usize, 2), e.fields.len);
+            try std.testing.expectEqual(@as(u8, 'S'), e.fields[0].code);
+            try std.testing.expectEqualStrings("ERROR", e.fields[0].value);
+            try std.testing.expectEqual(@as(u8, 'M'), e.fields[1].code);
+            try std.testing.expectEqualStrings("test error", e.fields[1].value);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode empty_query_response" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, 'I', &.{});
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    try std.testing.expectEqual(BackendMsg.empty_query_response, result.msg);
+}
+
+test "decode unknown message type" {
+    const allocator = std.testing.allocator;
+    const data = try buildBackendMsg(allocator, 0xFF, &.{});
+    defer allocator.free(data);
+
+    const result = readBackendMsg(data, allocator);
+    try std.testing.expectError(error.UnknownMessageType, result);
+}
+
+test "decode NeedMoreData for incomplete message" {
+    const allocator = std.testing.allocator;
+
+    // Less than 5 bytes
+    try std.testing.expectError(error.NeedMoreData, readBackendMsg(&.{ 'Z', 0, 0 }, allocator));
+    // Header says 10 bytes but only 7 provided
+    try std.testing.expectError(error.NeedMoreData, readBackendMsg(&.{ 'Z', 0, 0, 0, 10, 'I', 0 }, allocator));
+}
+
+test "decode parameter_description zero params" {
+    const allocator = std.testing.allocator;
+    var payload: [2]u8 = undefined;
+    std.mem.writeInt(i16, &payload, 0, .big);
+    const data = try buildBackendMsg(allocator, 't', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .parameter_description => |oids| {
+            defer allocator.free(oids);
+            try std.testing.expectEqual(@as(usize, 0), oids.len);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode backend_key_data" {
+    const allocator = std.testing.allocator;
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], 12345, .big);
+    std.mem.writeInt(u32, payload[4..8], 67890, .big);
+    const data = try buildBackendMsg(allocator, 'K', &payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .backend_key_data => |bkd| {
+            try std.testing.expectEqual(@as(u32, 12345), bkd.pid);
+            try std.testing.expectEqual(@as(u32, 67890), bkd.secret);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "decode parameter_status" {
+    const allocator = std.testing.allocator;
+    const payload = "server_version\x0016.2\x00";
+    const data = try buildBackendMsg(allocator, 'S', payload);
+    defer allocator.free(data);
+
+    const result = try readBackendMsg(data, allocator);
+    switch (result.msg) {
+        .parameter_status => |ps| {
+            defer {
+                allocator.free(ps.name);
+                allocator.free(ps.value);
+            }
+            try std.testing.expectEqualStrings("server_version", ps.name);
+            try std.testing.expectEqualStrings("16.2", ps.value);
+        },
+        else => return error.UnexpectedMessage,
+    }
+}
+
+test "roundtrip encode-decode parse" {
+    const allocator = std.testing.allocator;
+
+    // Encode a Parse message, then verify the structure
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try encodeParse(allocator, &buf, "stmt1", "SELECT $1::int");
+
+    // Verify message structure: 'P' + length + stmt_name\0 + query\0 + param_count(i16)
+    try std.testing.expectEqual(@as(u8, 'P'), buf.items[0]);
+    const len = std.mem.readInt(i32, buf.items[1..5], .big);
+    try std.testing.expectEqual(@as(usize, @intCast(1 + len)), buf.items.len);
+
+    // stmt_name starts at byte 5
+    const stmt_end = std.mem.indexOfScalarPos(u8, buf.items, 5, 0).?;
+    try std.testing.expectEqualStrings("stmt1", buf.items[5..stmt_end]);
+}

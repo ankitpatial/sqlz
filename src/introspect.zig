@@ -157,8 +157,12 @@ fn describeOne(
 ) !TypedQuery {
     const stmt_name = "";
 
+    // Replace @name named parameters with $N positional parameters (sqlc-compatible).
+    const named = try replaceNamedParams(allocator, uq.sql);
+    const effective_sql = if (named) |n| n.sql else uq.sql;
+
     // Quote alias hints (! / ?) so PostgreSQL accepts them as quoted identifiers
-    const clean_sql = try quoteAliasHints(allocator, uq.sql);
+    const clean_sql = try quoteAliasHints(allocator, effective_sql);
     defer allocator.free(clean_sql);
 
     // Send Parse → Describe(Statement) → Sync
@@ -204,8 +208,13 @@ fn describeOne(
         return error.QueryIntrospectionFailed;
     }
 
-    // Build params with names extracted from SQL context
-    const param_names = try extractParamNames(allocator, uq.sql, param_oids.len);
+    // Build params — use explicit names from @name syntax if available,
+    // otherwise fall back to heuristic extraction from SQL context.
+    const param_names = if (named) |n|
+        n.names
+    else
+        try extractParamNames(allocator, uq.sql, param_oids.len);
+
     const params = try allocator.alloc(Param, param_oids.len);
     for (param_oids, 0..) |param_oid, i| {
         var zig_type = type_cache.resolve(param_oid);
@@ -269,7 +278,7 @@ fn describeOne(
     return .{
         .name = uq.name,
         .file_path = uq.file_path,
-        .sql = uq.sql,
+        .sql = effective_sql,
         .comment = uq.comment,
         .kind = kind,
         .params = params,
@@ -367,6 +376,117 @@ fn resolveEnumType(
     }
 
     return null;
+}
+
+/// Result of replacing @name parameters with $N positional parameters.
+const NamedParamResult = struct {
+    sql: []const u8,
+    names: [][]const u8,
+};
+
+/// Replace sqlc-style @name named parameters with $N positional parameters.
+/// Each unique @name gets a unique $N number (assigned in order of first appearance).
+/// Repeated occurrences of the same @name reuse the same $N.
+/// Returns null if no @name parameters are found (SQL uses $N already).
+pub fn replaceNamedParams(allocator: std.mem.Allocator, sql: []const u8) !?NamedParamResult {
+    // Quick scan: bail out early if no @ params exist
+    var has_named = false;
+    for (0..sql.len) |idx| {
+        if (sql[idx] == '@' and idx + 1 < sql.len and
+            (std.ascii.isAlphabetic(sql[idx + 1]) or sql[idx + 1] == '_'))
+        {
+            has_named = true;
+            break;
+        }
+    }
+    if (!has_named) return null;
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < sql.len) {
+        const c = sql[i];
+
+        // Skip string literals (single-quoted)
+        if (c == '\'') {
+            try result.append(allocator, c);
+            i += 1;
+            while (i < sql.len) {
+                try result.append(allocator, sql[i]);
+                if (sql[i] == '\'') {
+                    if (i + 1 < sql.len and sql[i + 1] == '\'') {
+                        i += 1;
+                        try result.append(allocator, sql[i]);
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip line comments (-- ...)
+        if (c == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            while (i < sql.len and sql[i] != '\n') {
+                try result.append(allocator, sql[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check for @name
+        if (c == '@' and i + 1 < sql.len and
+            (std.ascii.isAlphabetic(sql[i + 1]) or sql[i + 1] == '_'))
+        {
+            const name_start = i + 1;
+            var name_end = name_start;
+            while (name_end < sql.len and
+                (std.ascii.isAlphanumeric(sql[name_end]) or sql[name_end] == '_'))
+            {
+                name_end += 1;
+            }
+            const name = sql[name_start..name_end];
+
+            // Find existing position or assign a new one
+            var pos: usize = 0;
+            for (names.items, 0..) |existing, idx| {
+                if (std.mem.eql(u8, existing, name)) {
+                    pos = idx + 1;
+                    break;
+                }
+            } else {
+                try names.append(allocator, name);
+                pos = names.items.len;
+            }
+
+            // Emit $N
+            var num_buf: [16]u8 = undefined;
+            const num_str = std.fmt.bufPrint(&num_buf, "${d}", .{pos}) catch unreachable;
+            try result.appendSlice(allocator, num_str);
+            i = name_end;
+            continue;
+        }
+
+        try result.append(allocator, c);
+        i += 1;
+    }
+
+    // Dupe all names so they're owned by the allocator
+    const final_names = try allocator.alloc([]const u8, names.items.len);
+    for (names.items, 0..) |name, idx| {
+        final_names[idx] = try allocator.dupe(u8, name);
+    }
+
+    return .{
+        .sql = try result.toOwnedSlice(allocator),
+        .names = final_names,
+    };
 }
 
 /// Extract parameter names from SQL context by inspecting surrounding tokens.
@@ -674,4 +794,454 @@ test "TypedQuery struct size" {
     try std.testing.expect(@sizeOf(TypedQuery) > 0);
     try std.testing.expect(@sizeOf(Column) > 0);
     try std.testing.expect(@sizeOf(Param) > 0);
+}
+
+test "replaceNamedParams basic" {
+    const allocator = std.testing.allocator;
+
+    {
+        // Simple @name replacement
+        const r = (try replaceNamedParams(allocator, "SELECT * FROM users WHERE id = @user_id")).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings("SELECT * FROM users WHERE id = $1", r.sql);
+        try std.testing.expectEqual(@as(usize, 1), r.names.len);
+        try std.testing.expectEqualStrings("user_id", r.names[0]);
+    }
+}
+
+test "replaceNamedParams repeated name reuses same position" {
+    const allocator = std.testing.allocator;
+
+    {
+        const r = (try replaceNamedParams(allocator,
+            "WHERE (@author_id::int IS NULL OR p.user_id = @author_id)",
+        )).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings(
+            "WHERE ($1::int IS NULL OR p.user_id = $1)",
+            r.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 1), r.names.len);
+        try std.testing.expectEqualStrings("author_id", r.names[0]);
+    }
+}
+
+test "replaceNamedParams multiple distinct names" {
+    const allocator = std.testing.allocator;
+
+    {
+        const r = (try replaceNamedParams(allocator,
+            "WHERE id = @id AND name = @name LIMIT @limit OFFSET @offset",
+        )).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings(
+            "WHERE id = $1 AND name = $2 LIMIT $3 OFFSET $4",
+            r.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 4), r.names.len);
+        try std.testing.expectEqualStrings("id", r.names[0]);
+        try std.testing.expectEqualStrings("name", r.names[1]);
+        try std.testing.expectEqualStrings("limit", r.names[2]);
+        try std.testing.expectEqualStrings("offset", r.names[3]);
+    }
+}
+
+test "replaceNamedParams returns null for positional params" {
+    const allocator = std.testing.allocator;
+
+    {
+        // No @name params — should return null
+        const r = try replaceNamedParams(allocator, "SELECT * FROM users WHERE id = $1");
+        try std.testing.expect(r == null);
+    }
+}
+
+test "replaceNamedParams preserves string literals" {
+    const allocator = std.testing.allocator;
+
+    {
+        const r = (try replaceNamedParams(allocator,
+            "SELECT * FROM users WHERE email = @email AND name = '@not_a_param'",
+        )).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings(
+            "SELECT * FROM users WHERE email = $1 AND name = '@not_a_param'",
+            r.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 1), r.names.len);
+        try std.testing.expectEqualStrings("email", r.names[0]);
+    }
+}
+
+test "replaceNamedParams preserves type casts" {
+    const allocator = std.testing.allocator;
+
+    {
+        const r = (try replaceNamedParams(allocator,
+            "WHERE (@published::boolean IS NULL OR p.published = @published)",
+        )).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings(
+            "WHERE ($1::boolean IS NULL OR p.published = $1)",
+            r.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 1), r.names.len);
+        try std.testing.expectEqualStrings("published", r.names[0]);
+    }
+}
+
+test "replaceNamedParams skips comments" {
+    const allocator = std.testing.allocator;
+
+    {
+        const r = (try replaceNamedParams(allocator,
+            "-- filter by @author\nWHERE id = @author_id",
+        )).?;
+        defer {
+            allocator.free(r.sql);
+            for (r.names) |n| allocator.free(n);
+            allocator.free(r.names);
+        }
+        try std.testing.expectEqualStrings(
+            "-- filter by @author\nWHERE id = $1",
+            r.sql,
+        );
+        try std.testing.expectEqual(@as(usize, 1), r.names.len);
+        try std.testing.expectEqualStrings("author_id", r.names[0]);
+    }
+}
+
+test "replaceNamedParams full SearchPosts query" {
+    const allocator = std.testing.allocator;
+
+    const sql =
+        \\SELECT p.id, p.title, p.body, p.published, p.created_at,
+        \\       u.name AS author_name
+        \\FROM posts p
+        \\JOIN users u ON u.id = p.user_id
+        \\WHERE (@author_id::int IS NULL OR p.user_id = @author_id)
+        \\  AND (@title_keyword::text IS NULL OR p.title ILIKE '%' || @title_keyword || '%')
+        \\  AND (@body_keyword::text IS NULL OR p.body ILIKE '%' || @body_keyword || '%')
+        \\  AND (@published::boolean IS NULL OR p.published = @published)
+        \\  AND (@created_after::timestamptz IS NULL OR p.created_at >= @created_after)
+        \\  AND (@created_before::timestamptz IS NULL OR p.created_at <= @created_before)
+        \\ORDER BY p.created_at DESC
+        \\LIMIT @limit
+        \\OFFSET @offset
+    ;
+
+    const r = (try replaceNamedParams(allocator, sql)).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+
+    // 8 unique named params
+    try std.testing.expectEqual(@as(usize, 8), r.names.len);
+    try std.testing.expectEqualStrings("author_id", r.names[0]);
+    try std.testing.expectEqualStrings("title_keyword", r.names[1]);
+    try std.testing.expectEqualStrings("body_keyword", r.names[2]);
+    try std.testing.expectEqualStrings("published", r.names[3]);
+    try std.testing.expectEqualStrings("created_after", r.names[4]);
+    try std.testing.expectEqualStrings("created_before", r.names[5]);
+    try std.testing.expectEqualStrings("limit", r.names[6]);
+    try std.testing.expectEqualStrings("offset", r.names[7]);
+
+    // Repeated @author_id should map to same $1
+    try std.testing.expect(std.mem.indexOf(u8, r.sql, "$1::int IS NULL OR p.user_id = $1") != null);
+    // No @name tokens should remain
+    for (r.sql, 0..) |c, idx| {
+        if (c == '@' and idx + 1 < r.sql.len and std.ascii.isAlphabetic(r.sql[idx + 1])) {
+            return error.UnexpectedNamedParam;
+        }
+    }
+}
+
+test "replaceNamedParams underscore-prefixed name" {
+    const allocator = std.testing.allocator;
+
+    const r = (try replaceNamedParams(allocator, "WHERE id = @_internal_id")).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+    try std.testing.expectEqualStrings("WHERE id = $1", r.sql);
+    try std.testing.expectEqualStrings("_internal_id", r.names[0]);
+}
+
+test "replaceNamedParams does not treat email @ as param" {
+    const allocator = std.testing.allocator;
+
+    // Bare @ followed by non-alpha/non-underscore should not be treated as a named param
+    const r = try replaceNamedParams(allocator, "WHERE email = 'user@123.com'");
+    try std.testing.expect(r == null);
+}
+
+test "replaceNamedParams adjacent to parentheses and operators" {
+    const allocator = std.testing.allocator;
+
+    const r = (try replaceNamedParams(allocator,
+        "WHERE (id=@id) AND age>@min_age AND age<@max_age",
+    )).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+    try std.testing.expectEqualStrings("WHERE (id=$1) AND age>$2 AND age<$3", r.sql);
+    try std.testing.expectEqual(@as(usize, 3), r.names.len);
+    try std.testing.expectEqualStrings("id", r.names[0]);
+    try std.testing.expectEqualStrings("min_age", r.names[1]);
+    try std.testing.expectEqualStrings("max_age", r.names[2]);
+}
+
+test "replaceNamedParams mixed positional and named is handled" {
+    const allocator = std.testing.allocator;
+
+    // If someone mixes $1 and @name, @name still gets replaced
+    const r = (try replaceNamedParams(allocator,
+        "WHERE id = $1 AND name = @name",
+    )).?;
+    defer {
+        allocator.free(r.sql);
+        for (r.names) |n| allocator.free(n);
+        allocator.free(r.names);
+    }
+    try std.testing.expectEqualStrings("WHERE id = $1 AND name = $1", r.sql);
+    try std.testing.expectEqual(@as(usize, 1), r.names.len);
+    try std.testing.expectEqualStrings("name", r.names[0]);
+}
+
+test "extractParamNames simple WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator, "SELECT * FROM users WHERE id = $1", 1);
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("id", names[0]);
+}
+
+test "extractParamNames multiple comparison operators" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator,
+        "WHERE age >= $1 AND age <= $2 AND name = $3",
+        3,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("age", names[0]);
+    try std.testing.expectEqualStrings("age", names[1]);
+    try std.testing.expectEqualStrings("name", names[2]);
+}
+
+test "extractParamNames LIMIT and OFFSET" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator,
+        "SELECT * FROM users LIMIT $1 OFFSET $2",
+        2,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("limit", names[0]);
+    try std.testing.expectEqualStrings("offset", names[1]);
+}
+
+test "extractParamNames INSERT column mapping" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator,
+        "INSERT INTO users (name, email, bio) VALUES ($1, $2, $3)",
+        3,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("name", names[0]);
+    try std.testing.expectEqualStrings("email", names[1]);
+    try std.testing.expectEqualStrings("bio", names[2]);
+}
+
+test "extractParamNames SET clause" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator,
+        "UPDATE users SET name = $1, email = $2 WHERE id = $3",
+        3,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("name", names[0]);
+    try std.testing.expectEqualStrings("email", names[1]);
+    try std.testing.expectEqualStrings("id", names[2]);
+}
+
+test "extractParamNames fallback naming" {
+    const allocator = std.testing.allocator;
+
+    // When context can't be determined, falls back to param_N
+    const names = try extractParamNames(allocator,
+        "SELECT * FROM users WHERE $1 AND $2",
+        2,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqualStrings("param_1", names[0]);
+    try std.testing.expectEqualStrings("param_2", names[1]);
+}
+
+test "extractParamNames skips string literals" {
+    const allocator = std.testing.allocator;
+
+    // $1 inside a string literal should not confuse the parser
+    const names = try extractParamNames(allocator,
+        "SELECT * FROM users WHERE name = $1 AND bio LIKE '$2 is not a param'",
+        1,
+    );
+    defer {
+        for (names) |n| allocator.free(n);
+        allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("name", names[0]);
+}
+
+test "extractParamNames zero params" {
+    const allocator = std.testing.allocator;
+
+    const names = try extractParamNames(allocator, "SELECT * FROM users", 0);
+    defer allocator.free(names);
+    try std.testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "fuzz replaceNamedParams" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const allocator = std.testing.allocator;
+            const result = try replaceNamedParams(allocator, input);
+            if (result) |r| {
+                defer {
+                    allocator.free(r.sql);
+                    for (r.names) |n| allocator.free(n);
+                    allocator.free(r.names);
+                }
+                // Invariant: output should never contain @name tokens outside
+                // comments and string literals
+                var idx: usize = 0;
+                while (idx < r.sql.len) {
+                    // Skip string literals
+                    if (r.sql[idx] == '\'') {
+                        idx += 1;
+                        while (idx < r.sql.len and r.sql[idx] != '\'') : (idx += 1) {}
+                        if (idx < r.sql.len) idx += 1;
+                        continue;
+                    }
+                    // Skip line comments
+                    if (r.sql[idx] == '-' and idx + 1 < r.sql.len and r.sql[idx + 1] == '-') {
+                        while (idx < r.sql.len and r.sql[idx] != '\n') : (idx += 1) {}
+                        continue;
+                    }
+                    if (r.sql[idx] == '@' and idx + 1 < r.sql.len and
+                        (std.ascii.isAlphabetic(r.sql[idx + 1]) or r.sql[idx + 1] == '_'))
+                    {
+                        return error.UnreplacedNamedParam;
+                    }
+                    idx += 1;
+                }
+                // Invariant: all names should be non-empty
+                for (r.names) |name| {
+                    if (name.len == 0) return error.EmptyParamName;
+                }
+            }
+        }
+    }.run, .{
+        .corpus = &.{
+            "SELECT * FROM users WHERE id = @user_id",
+            "WHERE (@x::int IS NULL OR col = @x) AND @y = 1",
+            "SELECT '@not_a_param' FROM t WHERE a = @real_param",
+            "-- comment @ignored\nWHERE x = @val",
+            "",
+            "@",
+            "@@",
+            "@123",
+            "hello@world",
+        },
+    });
+}
+
+test "fuzz extractParamNames" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const allocator = std.testing.allocator;
+            // Count $N references in input to determine param_count
+            var max_param: usize = 0;
+            var i: usize = 0;
+            while (i < input.len) : (i += 1) {
+                if (input[i] == '$' and i + 1 < input.len and std.ascii.isDigit(input[i + 1])) {
+                    var end = i + 1;
+                    while (end < input.len and std.ascii.isDigit(input[end])) : (end += 1) {}
+                    const num = std.fmt.parseInt(usize, input[i + 1 .. end], 10) catch continue;
+                    if (num > max_param) max_param = num;
+                }
+            }
+            if (max_param > 64) return; // skip unreasonably large param counts
+            const names = try extractParamNames(allocator, input, max_param);
+            defer {
+                for (names) |n| allocator.free(n);
+                allocator.free(names);
+            }
+            // Invariant: should return exactly max_param names
+            if (names.len != max_param) return error.WrongNameCount;
+            // Invariant: all names should be non-empty
+            for (names) |name| {
+                if (name.len == 0) return error.EmptyName;
+            }
+        }
+    }.run, .{
+        .corpus = &.{
+            "SELECT * FROM users WHERE id = $1",
+            "INSERT INTO t (a, b) VALUES ($1, $2)",
+            "UPDATE t SET x = $1 WHERE id = $2",
+            "SELECT * FROM t LIMIT $1 OFFSET $2",
+            "WHERE a >= $1 AND b <= $2",
+            "",
+            "no params here",
+            "$1 $1 $1",
+        },
+    });
 }

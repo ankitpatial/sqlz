@@ -954,3 +954,242 @@ test "generated code is valid Zig syntax" {
     defer ast.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
 }
+
+test "snakeToPascal edge cases" {
+    const allocator = std.testing.allocator;
+
+    // Leading underscores
+    {
+        const result = try snakeToPascal(allocator, "_private");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("Private", result);
+    }
+    // Double underscores
+    {
+        const result = try snakeToPascal(allocator, "a__b");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("AB", result);
+    }
+    // All underscores
+    {
+        const result = try snakeToPascal(allocator, "___");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("", result);
+    }
+    // Single character
+    {
+        const result = try snakeToPascal(allocator, "x");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("X", result);
+    }
+    // Already PascalCase
+    {
+        const result = try snakeToPascal(allocator, "AlreadyPascal");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("AlreadyPascal", result);
+    }
+}
+
+test "snakeToCamel edge cases" {
+    const allocator = std.testing.allocator;
+
+    // Single word stays lowercase
+    {
+        const result = try snakeToCamel(allocator, "name");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("name", result);
+    }
+    // Leading underscore
+    {
+        const result = try snakeToCamel(allocator, "_field");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("Field", result);
+    }
+    // Trailing underscore
+    {
+        const result = try snakeToCamel(allocator, "field_");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("field", result);
+    }
+}
+
+test "generate query with doc comment" {
+    const allocator = std.testing.allocator;
+
+    const params = try allocator.alloc(introspect.Param, 1);
+    defer allocator.free(params);
+    params[0] = .{ .index = 0, .name = "id", .zig_type = .i32_type };
+
+    const columns = try allocator.alloc(introspect.Column, 1);
+    defer allocator.free(columns);
+    columns[0] = .{ .name = "id", .zig_type = .i32_type, .nullable = false, .table_oid = 0, .column_attr = 0 };
+
+    const queries = [_]introspect.TypedQuery{.{
+        .name = "GetUser",
+        .file_path = "sql/test.sql",
+        .sql = "SELECT id FROM users WHERE id = $1",
+        .comment = "Find a user by primary key.",
+        .kind = .one,
+        .params = params,
+        .columns = columns,
+    }};
+
+    const result = try generate(allocator, &queries, null);
+    defer allocator.free(result);
+
+    // Doc comment should appear in output
+    try std.testing.expect(std.mem.indexOf(u8, result, "/// Find a user by primary key.") != null);
+}
+
+test "generate params struct threshold boundary" {
+    const allocator = std.testing.allocator;
+
+    // Exactly 3 params — should NOT generate a Params struct (threshold is >3)
+    const params_3 = try allocator.alloc(introspect.Param, 3);
+    defer allocator.free(params_3);
+    params_3[0] = .{ .index = 0, .name = "id", .zig_type = .i32_type };
+    params_3[1] = .{ .index = 1, .name = "name", .zig_type = .text };
+    params_3[2] = .{ .index = 2, .name = "email", .zig_type = .text };
+
+    const columns = try allocator.alloc(introspect.Column, 1);
+    defer allocator.free(columns);
+    columns[0] = .{ .name = "id", .zig_type = .i32_type, .nullable = false, .table_oid = 0, .column_attr = 0 };
+
+    const queries_3 = [_]introspect.TypedQuery{.{
+        .name = "UpdateThree",
+        .file_path = "sql/test.sql",
+        .sql = "UPDATE t SET name = $2, email = $3 WHERE id = $1",
+        .comment = null,
+        .kind = .one,
+        .params = params_3,
+        .columns = columns,
+    }};
+
+    const result_3 = try generate(allocator, &queries_3, null);
+    defer allocator.free(result_3);
+    // No Params struct for <=3
+    try std.testing.expect(std.mem.indexOf(u8, result_3, "UpdateThreeParams") == null);
+
+    // 4 params — SHOULD generate a Params struct
+    const params_4 = try allocator.alloc(introspect.Param, 4);
+    defer allocator.free(params_4);
+    params_4[0] = .{ .index = 0, .name = "id", .zig_type = .i32_type };
+    params_4[1] = .{ .index = 1, .name = "name", .zig_type = .text };
+    params_4[2] = .{ .index = 2, .name = "email", .zig_type = .text };
+    params_4[3] = .{ .index = 3, .name = "bio", .zig_type = .text };
+
+    const queries_4 = [_]introspect.TypedQuery{.{
+        .name = "UpdateFour",
+        .file_path = "sql/test.sql",
+        .sql = "UPDATE t SET name = $2, email = $3, bio = $4 WHERE id = $1",
+        .comment = null,
+        .kind = .one,
+        .params = params_4,
+        .columns = columns,
+    }};
+
+    const result_4 = try generate(allocator, &queries_4, null);
+    defer allocator.free(result_4);
+    try std.testing.expect(std.mem.indexOf(u8, result_4, "UpdateFourParams") != null);
+}
+
+test "generate with helper import" {
+    const allocator = std.testing.allocator;
+
+    const columns = try allocator.alloc(introspect.Column, 1);
+    defer allocator.free(columns);
+    columns[0] = .{ .name = "created_at", .zig_type = .timestamp, .nullable = false, .table_oid = 0, .column_attr = 0 };
+
+    const queries = [_]introspect.TypedQuery{.{
+        .name = "ListItems",
+        .file_path = "sql/test.sql",
+        .sql = "SELECT created_at FROM items",
+        .comment = null,
+        .kind = .many,
+        .params = &.{},
+        .columns = columns,
+    }};
+
+    const result = try generate(allocator, &queries, "helper.zig");
+    defer allocator.free(result);
+
+    // Should import helper
+    try std.testing.expect(std.mem.indexOf(u8, result, "@import(\"helper.zig\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "helper.Timestamp") != null);
+}
+
+test "generate nullable vs non-nullable columns" {
+    const allocator = std.testing.allocator;
+
+    const columns = try allocator.alloc(introspect.Column, 2);
+    defer allocator.free(columns);
+    columns[0] = .{ .name = "id", .zig_type = .i32_type, .nullable = false, .table_oid = 0, .column_attr = 0 };
+    columns[1] = .{ .name = "bio", .zig_type = .text, .nullable = true, .table_oid = 0, .column_attr = 0 };
+
+    const queries = [_]introspect.TypedQuery{.{
+        .name = "GetProfile",
+        .file_path = "sql/test.sql",
+        .sql = "SELECT id, bio FROM users WHERE id = $1",
+        .comment = null,
+        .kind = .one,
+        .params = &.{},
+        .columns = columns,
+    }};
+
+    const result = try generate(allocator, &queries, null);
+    defer allocator.free(result);
+
+    // Non-nullable field: plain type
+    try std.testing.expect(std.mem.indexOf(u8, result, "id: i32") != null);
+    // Nullable field: optional type
+    try std.testing.expect(std.mem.indexOf(u8, result, "bio: ?[]const u8") != null);
+}
+
+test "fuzz snakeToPascal" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const allocator = std.testing.allocator;
+            // Only test with valid ASCII identifiers
+            for (input) |c| {
+                if (!std.ascii.isAlphanumeric(c) and c != '_') return;
+            }
+            if (input.len == 0) return;
+            const result = try snakeToPascal(allocator, input);
+            defer allocator.free(result);
+            // Result should never be longer than input
+            if (result.len > input.len) return error.OutputTooLong;
+        }
+    }.run, .{
+        .corpus = &.{
+            "find_user_by_id",
+            "get_all",
+            "user",
+            "__double__under__",
+            "a",
+            "ABC",
+        },
+    });
+}
+
+test "fuzz snakeToCamel" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const allocator = std.testing.allocator;
+            for (input) |c| {
+                if (!std.ascii.isAlphanumeric(c) and c != '_') return;
+            }
+            if (input.len == 0) return;
+            const result = try snakeToCamel(allocator, input);
+            defer allocator.free(result);
+            if (result.len > input.len) return error.OutputTooLong;
+        }
+    }.run, .{
+        .corpus = &.{
+            "find_user_by_id",
+            "list_users",
+            "user",
+            "_field",
+            "x",
+        },
+    });
+}

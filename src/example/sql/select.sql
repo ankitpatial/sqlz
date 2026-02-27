@@ -46,3 +46,19 @@ JOIN tags t ON t.id = pt.tag_id
 JOIN users u ON u.id = p.user_id
 WHERE t.name = $1
 ORDER BY p.created_at DESC;
+
+-- name: SearchPosts :many
+-- Search posts with multiple filters: author, keyword, published status, date range, and pagination.
+SELECT p.id, p.title, p.body, p.published, p.created_at,
+       u.name AS author_name
+FROM posts p
+JOIN users u ON u.id = p.user_id
+WHERE (@author_id::int IS NULL OR p.user_id = @author_id)
+  AND (@title_keyword::text IS NULL OR p.title ILIKE '%' || @title_keyword || '%')
+  AND (@body_keyword::text IS NULL OR p.body ILIKE '%' || @body_keyword || '%')
+  AND (@published::boolean IS NULL OR p.published = @published)
+  AND (@created_after::timestamptz IS NULL OR p.created_at >= @created_after)
+  AND (@created_before::timestamptz IS NULL OR p.created_at <= @created_before)
+ORDER BY p.created_at DESC
+LIMIT @limit
+OFFSET @offset;

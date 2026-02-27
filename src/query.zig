@@ -508,3 +508,227 @@ test "parseContent fallback without annotations" {
     // Trailing semicolon should be stripped
     try std.testing.expect(!std.mem.endsWith(u8, queries[0].sql, ";"));
 }
+
+test "parseContent empty SQL body skipped" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\-- name: ValidQuery :one
+        \\SELECT 1;
+        \\
+        \\-- name: EmptyQuery :exec
+        \\
+        \\-- name: AnotherValid :exec
+        \\DELETE FROM t WHERE id = $1;
+    ;
+
+    const queries = try parseContent(allocator, content, "sql/test.sql");
+    defer {
+        for (queries) |q| freeUntypedQuery(allocator, q);
+        allocator.free(queries);
+    }
+
+    // EmptyQuery should be skipped
+    try std.testing.expectEqual(@as(usize, 2), queries.len);
+    try std.testing.expectEqualStrings("ValidQuery", queries[0].name);
+    try std.testing.expectEqualStrings("AnotherValid", queries[1].name);
+}
+
+test "parseContent multiple semicolons stripped" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\-- name: Test :exec
+        \\DELETE FROM users WHERE id = $1;;;
+    ;
+
+    const queries = try parseContent(allocator, content, "sql/test.sql");
+    defer {
+        for (queries) |q| freeUntypedQuery(allocator, q);
+        allocator.free(queries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), queries.len);
+    try std.testing.expect(!std.mem.endsWith(u8, queries[0].sql, ";"));
+}
+
+test "parseContent doc comment preserved across lines" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\-- name: GetUser :one
+        \\-- Find a user by their ID.
+        \\-- Returns null if not found.
+        \\SELECT * FROM users WHERE id = $1;
+    ;
+
+    const queries = try parseContent(allocator, content, "sql/test.sql");
+    defer {
+        for (queries) |q| freeUntypedQuery(allocator, q);
+        allocator.free(queries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), queries.len);
+    try std.testing.expect(queries[0].comment != null);
+    try std.testing.expectEqualStrings(
+        "Find a user by their ID.\nReturns null if not found.",
+        queries[0].comment.?,
+    );
+}
+
+test "parseContent all four query kinds" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\-- name: One :one
+        \\SELECT 1;
+        \\
+        \\-- name: Many :many
+        \\SELECT 1;
+        \\
+        \\-- name: Exec :exec
+        \\DELETE FROM t;
+        \\
+        \\-- name: ExecRows :execrows
+        \\UPDATE t SET a = 1;
+    ;
+
+    const queries = try parseContent(allocator, content, "sql/test.sql");
+    defer {
+        for (queries) |q| freeUntypedQuery(allocator, q);
+        allocator.free(queries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), queries.len);
+    try std.testing.expectEqual(QueryKind.one, queries[0].kind.?);
+    try std.testing.expectEqual(QueryKind.many, queries[1].kind.?);
+    try std.testing.expectEqual(QueryKind.exec, queries[2].kind.?);
+    try std.testing.expectEqual(QueryKind.execrows, queries[3].kind.?);
+}
+
+test "parseContent only whitespace returns error" {
+    const allocator = std.testing.allocator;
+    const result = parseContent(allocator, "   \n  \n  ", "sql/empty.sql");
+    try std.testing.expectError(error.EmptyQuery, result);
+}
+
+test "parseSqlcAnnotation edge cases" {
+    // Extra whitespace
+    {
+        const ann = parseSqlcAnnotation("  name:   FindUser   :one  ");
+        try std.testing.expect(ann != null);
+        try std.testing.expectEqualStrings("FindUser", ann.?.name);
+        try std.testing.expectEqual(QueryKind.one, ann.?.kind);
+    }
+    // Invalid kind
+    {
+        const ann = parseSqlcAnnotation("name: Test :invalid");
+        try std.testing.expect(ann == null);
+    }
+    // Missing kind colon
+    {
+        const ann = parseSqlcAnnotation("name: Test");
+        try std.testing.expect(ann == null);
+    }
+    // Empty name
+    {
+        const ann = parseSqlcAnnotation("name: :one");
+        try std.testing.expect(ann == null);
+    }
+    // Just "name:" with nothing after
+    {
+        const ann = parseSqlcAnnotation("name:");
+        try std.testing.expect(ann == null);
+    }
+}
+
+test "validateIdentifier Zig keywords are escaped" {
+    const allocator = std.testing.allocator;
+
+    const keywords = [_][]const u8{ "const", "fn", "return", "if", "else", "while", "for", "var", "pub", "try" };
+    for (keywords) |kw| {
+        const result = try validateIdentifier(allocator, kw);
+        defer allocator.free(result);
+        // Should be @"keyword"
+        try std.testing.expect(std.mem.startsWith(u8, result, "@\""));
+        try std.testing.expect(std.mem.endsWith(u8, result, "\""));
+    }
+}
+
+test "validateIdentifier valid names pass through" {
+    const allocator = std.testing.allocator;
+
+    const valid = [_][]const u8{ "user_id", "_private", "camelCase", "PascalCase", "x", "a1b2c3" };
+    for (valid) |name| {
+        const result = try validateIdentifier(allocator, name);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings(name, result);
+    }
+}
+
+test "validateIdentifier invalid names rejected" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidIdentifier, validateIdentifier(allocator, ""));
+    try std.testing.expectError(error.InvalidIdentifier, validateIdentifier(allocator, "123"));
+    try std.testing.expectError(error.InvalidIdentifier, validateIdentifier(allocator, "a-b"));
+    try std.testing.expectError(error.InvalidIdentifier, validateIdentifier(allocator, "a b"));
+    try std.testing.expectError(error.InvalidIdentifier, validateIdentifier(allocator, ".dot"));
+}
+
+test "fuzz parseSqlcAnnotation" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            // parseSqlcAnnotation should never crash — just return null or valid annotation
+            const result = parseSqlcAnnotation(input);
+            if (result) |ann| {
+                // Invariant: name and kind must be valid
+                if (ann.name.len == 0) return error.EmptyName;
+                _ = ann.kind; // must be a valid enum value
+            }
+        }
+    }.run, .{
+        .corpus = &.{
+            "name: GetUser :one",
+            "name: ListUsers :many",
+            "name: DeleteUser :exec",
+            "name: UpdateUser :execrows",
+            "name:",
+            "name: :one",
+            "",
+            "not an annotation",
+            "name: A :one :many",
+            "name: A:B :one",
+        },
+    });
+}
+
+test "fuzz parseContent" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const allocator = std.testing.allocator;
+            const queries = parseContent(allocator, input, "fuzz/test.sql") catch |err| {
+                // These errors are expected for invalid input
+                switch (err) {
+                    error.EmptyQuery => return,
+                    error.OutOfMemory => return,
+                    else => return err,
+                }
+            };
+            defer {
+                for (queries) |q| freeUntypedQuery(allocator, q);
+                allocator.free(queries);
+            }
+            // Invariant: each query must have non-empty name and sql
+            for (queries) |q| {
+                if (q.name.len == 0) return error.EmptyName;
+                if (q.sql.len == 0) return error.EmptySql;
+            }
+        }
+    }.run, .{
+        .corpus = &.{
+            "-- name: Test :one\nSELECT 1;",
+            "-- name: A :one\nSELECT 1;\n\n-- name: B :exec\nDELETE FROM t;",
+            "SELECT * FROM users;",
+            "",
+            "-- just a comment",
+            "-- name: X :one\n-- name: Y :many\nSELECT 1;",
+        },
+    });
+}
