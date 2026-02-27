@@ -6,7 +6,7 @@ const version = update.version;
 
 const Mode = enum {
     generate,
-    check,
+    verify,
     update,
 };
 
@@ -66,8 +66,8 @@ pub fn main() !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, arg, "check")) {
-            config.mode = .check;
+        } else if (std.mem.eql(u8, arg, "verify")) {
+            config.mode = .verify;
         } else if (std.mem.eql(u8, arg, "generate")) {
             config.mode = .generate;
         } else if (std.mem.eql(u8, arg, "update")) {
@@ -82,7 +82,7 @@ pub fn main() !void {
 
     // Validate mode
     if (config.mode == null) {
-        try stderr.writeAll("Missing required command: generate, check, or update\n\n");
+        try stderr.writeAll("Missing required command: generate, verify, or update\n\n");
         try printUsage(stderr);
         try stderr.flush();
         std.process.exit(1);
@@ -97,7 +97,7 @@ pub fn main() !void {
         return;
     }
 
-    // Validate required arguments for generate/check
+    // Validate required arguments for generate/verify
     if (config.src_dir == null) {
         try stderr.writeAll("Missing required option: --src <dir>\n\n");
         try printUsage(stderr);
@@ -254,14 +254,11 @@ pub fn main() !void {
     var all_typed_query_slices: std.ArrayList([]const lib.introspect.TypedQuery) = .empty;
     defer all_typed_query_slices.deinit(allocator);
 
-    // Keep typed queries alive until after helper/root generation
-    var all_typed_queries: std.ArrayList(std.ArrayList(lib.introspect.TypedQuery)) = .empty;
+    // Keep describe results alive until after helper/root generation
+    var all_describe_results: std.ArrayList(lib.introspect.DescribeResult) = .empty;
     defer {
-        for (all_typed_queries.items) |*tqs| {
-            for (tqs.items) |*tq| tq.deinit(allocator);
-            tqs.deinit(allocator);
-        }
-        all_typed_queries.deinit(allocator);
+        for (all_describe_results.items) |*dr| dr.deinit(allocator);
+        all_describe_results.deinit(allocator);
     }
 
     // Track which groups succeeded introspection (by index into groups.items)
@@ -292,7 +289,7 @@ pub fn main() !void {
 
         if (untyped_queries.items.len == 0) continue;
 
-        const typed_queries = lib.introspect.describeQueries(
+        var describe_result = lib.introspect.describeQueries(
             allocator,
             &conn,
             untyped_queries.items,
@@ -309,8 +306,27 @@ pub fn main() !void {
             continue;
         };
 
-        try all_typed_query_slices.append(allocator, typed_queries.items);
-        try all_typed_queries.append(allocator, typed_queries);
+        // Report per-query validation errors with actual PostgreSQL messages
+        for (describe_result.errors.items) |ve| {
+            const e = lib.errors.Error{ .query_error = .{
+                .file_path = ve.file_path,
+                .message = ve.message,
+                .detail = ve.detail,
+                .position = ve.position,
+            } };
+            try e.format(stderr, use_color);
+            try stderr.flush();
+            error_count += 1;
+        }
+
+        // Skip code generation for this group if any query failed validation
+        if (describe_result.errors.items.len > 0 and describe_result.queries.items.len == 0) {
+            describe_result.deinit(allocator);
+            continue;
+        }
+
+        try all_typed_query_slices.append(allocator, describe_result.queries.items);
+        try all_describe_results.append(allocator, describe_result);
         try successful_group_indices.append(allocator, group_idx);
     }
 
@@ -420,7 +436,7 @@ pub fn main() !void {
                 try stderr.print("  Generated {s}\n", .{group.output_path});
                 try stderr.flush();
             },
-            .check => {
+            .verify => {
                 const existing = std.fs.cwd().openFile(group.output_path, .{}) catch {
                     try stderr.print("  {s}: file does not exist (would be generated)\n", .{group.output_path});
                     try stderr.flush();
@@ -435,7 +451,10 @@ pub fn main() !void {
                 };
                 defer allocator.free(existing_content);
 
-                if (!std.mem.eql(u8, existing_content, generated)) {
+                const formatted = zigFmt(allocator, generated);
+                defer if (formatted.ptr != generated.ptr) allocator.free(formatted);
+
+                if (!std.mem.eql(u8, existing_content, formatted)) {
                     try stderr.print("  {s}: out of date\n", .{group.output_path});
                     try stderr.flush();
                     error_count += 1;
@@ -453,7 +472,7 @@ pub fn main() !void {
         if (helper_content) |hc| {
             switch (config.mode.?) {
                 .generate => try writeOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
-                .check => try checkOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
+                .verify => try checkOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
                 .update => unreachable,
             }
         }
@@ -479,7 +498,7 @@ pub fn main() !void {
 
         switch (config.mode.?) {
             .generate => try writeOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
-            .check => try checkOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
+            .verify => try checkOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
             .update => unreachable,
         }
 
@@ -508,7 +527,7 @@ pub fn main() !void {
     if (use_color) try stderr.writeAll("\x1b[32m");
     switch (config.mode.?) {
         .generate => try stderr.writeAll("Done.\n"),
-        .check => try stderr.writeAll("All files up to date.\n"),
+        .verify => try stderr.writeAll("All queries valid. All files up to date.\n"),
         .update => unreachable,
     }
     if (use_color) try stderr.writeAll("\x1b[0m");
@@ -583,7 +602,10 @@ fn checkOutputFile(
     };
     defer allocator.free(existing_content);
 
-    if (!std.mem.eql(u8, existing_content, content)) {
+    const formatted = zigFmt(allocator, content);
+    defer if (formatted.ptr != content.ptr) allocator.free(formatted);
+
+    if (!std.mem.eql(u8, existing_content, formatted)) {
         try stderr.print("  {s}: out of date\n", .{output_path});
         try stderr.flush();
         error_count.* += 1;
@@ -591,6 +613,55 @@ fn checkOutputFile(
         try stderr.print("  {s}: up to date\n", .{output_path});
         try stderr.flush();
     }
+}
+
+/// Format Zig source code via `zig fmt --stdin`. Returns formatted content
+/// or the original content if zig fmt is unavailable.
+/// Format Zig source code via `zig fmt --stdin`. Returns formatted content
+/// or the original content if zig fmt is unavailable.
+fn zigFmt(allocator: std.mem.Allocator, source: []const u8) []const u8 {
+    var child = std.process.Child.init(
+        &.{ "zig", "fmt", "--stdin" },
+        allocator,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch return source;
+
+    // Write source to stdin and close it so zig fmt processes the input
+    if (child.stdin) |stdin| {
+        stdin.writeAll(source) catch {};
+        stdin.close();
+        child.stdin = null;
+    }
+
+    // Collect stdout and stderr
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    child.collectOutput(allocator, &stdout_buf, &stderr_buf, 10 * 1024 * 1024) catch {
+        stdout_buf.deinit(allocator);
+        _ = child.wait() catch {};
+        return source;
+    };
+
+    const term = child.wait() catch {
+        stdout_buf.deinit(allocator);
+        return source;
+    };
+
+    if (term.Exited == 0 and stdout_buf.items.len > 0) {
+        return allocator.dupe(u8, stdout_buf.items) catch {
+            stdout_buf.deinit(allocator);
+            return source;
+        };
+    }
+
+    stdout_buf.deinit(allocator);
+    return source;
 }
 
 fn parseDatabaseUrl(config: *Config, url: []const u8) !void {
@@ -674,7 +745,7 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\
         \\Commands:
         \\  generate    Generate Zig code from SQL files
-        \\  check       Check if generated files are up to date
+        \\  verify      Validate SQL queries against the database and verify generated files are up to date
         \\  update      Update sqlz to the latest version
         \\
         \\Options:

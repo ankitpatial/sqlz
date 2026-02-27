@@ -82,6 +82,9 @@ pub const QueryError = struct {
         try w.writeAll("error: ");
         if (use_color) try w.writeAll("\x1b[0m");
         try w.writeAll(self.message);
+        if (self.position) |p| {
+            try w.print(" (at position {d})", .{p});
+        }
         try w.writeByte('\n');
         if (self.detail) |d| {
             try w.writeAll("  ");

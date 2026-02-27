@@ -1,6 +1,6 @@
 # sqlz
 
-Type-safe SQL code generation for Zig — like [sqlc](https://sqlc.dev), but for Zig.
+Type-safe PostgreSQL sql code generation for Zig — like [sqlc](https://sqlc.dev), but for Zig.
 
 Reads `.sql` files, introspects a live PostgreSQL database, and generates Zig structs and query functions.
 

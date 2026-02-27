@@ -36,24 +36,56 @@ pub const TypedQuery = struct {
     }
 };
 
+/// Per-query validation error with the actual PostgreSQL error message.
+pub const QueryValidationError = struct {
+    query_name: []const u8,
+    file_path: []const u8,
+    message: []const u8,
+    detail: ?[]const u8 = null,
+    position: ?u32 = null,
+};
+
+/// Result of describing a batch of queries — includes both successes and per-query errors.
+pub const DescribeResult = struct {
+    queries: std.ArrayList(TypedQuery),
+    errors: std.ArrayList(QueryValidationError),
+
+    pub fn deinit(self: *DescribeResult, allocator: std.mem.Allocator) void {
+        for (self.queries.items) |*tq| tq.deinit(allocator);
+        self.queries.deinit(allocator);
+        self.errors.deinit(allocator);
+    }
+};
+
 /// Introspect queries against a live PostgreSQL database using the
 /// extended query protocol (Parse/Describe/Sync).
+/// Validates all queries and continues on per-query failures, collecting errors.
 pub fn describeQueries(
     allocator: std.mem.Allocator,
     conn: *connection.Connection,
     untyped: []const query_mod.UntypedQuery,
     type_cache: *types.TypeCache,
     null_cache: *types.NullabilityCache,
-) !std.ArrayList(TypedQuery) {
-    var result: std.ArrayList(TypedQuery) = .empty;
-    errdefer {
-        for (result.items) |*tq| tq.deinit(allocator);
-        result.deinit(allocator);
-    }
+) !DescribeResult {
+    var result: DescribeResult = .{
+        .queries = .empty,
+        .errors = .empty,
+    };
+    errdefer result.deinit(allocator);
 
     for (untyped) |uq| {
-        const typed = try describeOne(allocator, conn, type_cache, null_cache, uq);
-        try result.append(allocator, typed);
+        const typed = describeOne(allocator, conn, type_cache, null_cache, uq, &result.errors) catch |err| {
+            if (err != error.QueryValidationFailed) {
+                // Non-PG error (e.g., connection issue) — add generic entry
+                try result.errors.append(allocator, .{
+                    .query_name = uq.name,
+                    .file_path = uq.file_path,
+                    .message = @errorName(err),
+                });
+            }
+            continue;
+        };
+        try result.queries.append(allocator, typed);
     }
 
     return result;
@@ -154,6 +186,7 @@ fn describeOne(
     type_cache: *types.TypeCache,
     null_cache: *types.NullabilityCache,
     uq: query_mod.UntypedQuery,
+    validation_errors: ?*std.ArrayList(QueryValidationError),
 ) !TypedQuery {
     const stmt_name = "";
 
@@ -178,6 +211,8 @@ fn describeOne(
     var row_fields: []const protocol.RowField = &.{};
     var has_error = false;
     var error_msg: []const u8 = "";
+    var error_detail: ?[]const u8 = null;
+    var error_position: ?u32 = null;
 
     for (msgs.items) |msg| {
         switch (msg) {
@@ -193,9 +228,11 @@ fn describeOne(
             .error_response => |e| {
                 has_error = true;
                 for (e.fields) |field| {
-                    if (field.code == 'M') {
-                        error_msg = field.value;
-                        break;
+                    switch (field.code) {
+                        'M' => error_msg = field.value,
+                        'D' => error_detail = field.value,
+                        'P' => error_position = std.fmt.parseInt(u32, field.value, 10) catch null,
+                        else => {},
                     }
                 }
             },
@@ -204,6 +241,16 @@ fn describeOne(
     }
 
     if (has_error) {
+        if (validation_errors) |errs| {
+            try errs.append(allocator, .{
+                .query_name = uq.name,
+                .file_path = uq.file_path,
+                .message = error_msg,
+                .detail = error_detail,
+                .position = error_position,
+            });
+            return error.QueryValidationFailed;
+        }
         std.log.err("Query {s}: {s}", .{ uq.name, error_msg });
         return error.QueryIntrospectionFailed;
     }
